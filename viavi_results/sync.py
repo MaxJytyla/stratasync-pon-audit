@@ -23,7 +23,16 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from .config import Settings, StrataSyncSettings, app_data_dir
-from .pon_audit import AUDIT_TABS, UpdatePlan, build_indexes, plan_updates, reading_from_search, readings_from_result
+from .pon_audit import (
+    AUDIT_TABS,
+    Flag,
+    UpdatePlan,
+    build_indexes,
+    is_multi_service,
+    plan_updates,
+    reading_from_search,
+    readings_from_result,
+)
 from .sheets import SheetWriter
 from .stratasync import SYNC_TIME, StrataSyncClient, StrataSyncError
 from .sync_state import SyncState
@@ -97,18 +106,33 @@ def run_sync(
     log(f"Found {len(found)} result(s): {len(records)} {TEST_TYPE}, {len(new)} new")
 
     readings = []
+    # A record that can't be read is flagged rather than stopping the run, and
+    # doesn't hold back the download position (it would fail the same way every time).
+    unreadable = []
     for rec in sorted(new, key=lambda r: r.get("syncTime", "")):
-        if rec.get("power") not in (None, ""):
-            readings.append(reading_from_search(rec))
-            continue
-        log(f"Downloading {rec.get('name')} (no power reading in search result)")
+        source = f"{rec.get('name')} (id {rec['_id']})"
+        if rec.get("power") not in (None, "") and not is_multi_service(rec):
+            try:
+                readings.append(reading_from_search(rec))
+                continue
+            except ValueError as exc:
+                log(f"Unexpected search values for {source}: {exc}")
+        why = "tested several PON types" if is_multi_service(rec) else "no usable power reading in search result"
+        log(f"Downloading {rec.get('name')} ({why})")
         try:
             doc = client.download_json(rec["_id"])
-        except (StrataSyncError, ValueError) as exc:
-            result.download_failures.append(f"{rec.get('name')} ({rec['_id']}): {exc}")
-            log(f"  could not download {rec.get('name')} ({rec['_id']}): {exc}")
+        except StrataSyncError as exc:
+            result.download_failures.append(f"{source}: {exc}")
+            log(f"  could not download {source}: {exc}")
             continue
-        readings.extend(readings_from_result(doc, source=f"{rec.get('name')} (id {rec['_id']})"))
+        except ValueError as exc:
+            unreadable.append(Flag("unreadable", f"{rec.get('testLocationsLabel') or source}: "
+                                                 f"test file could not be read ({exc})"))
+            continue
+        try:
+            readings.extend(readings_from_result(doc, source=source))
+        except ValueError as exc:
+            unreadable.append(Flag("unreadable", f"{rec.get('testLocationsLabel') or source}: {exc}"))
 
     log("Opening the Google Sheet")
     writer = SheetWriter(settings)
@@ -118,6 +142,7 @@ def run_sync(
     if result.missing_tabs:
         log(f"Warning: tabs not found: {', '.join(result.missing_tabs)}")
     result.plan = plan_updates(readings, build_indexes(tabs))
+    result.plan.flags.extend(unreadable)
     log(f"Planned {len(result.plan.written)} result(s) to write, {len(result.plan.flags)} flag(s)")
 
     if not apply:

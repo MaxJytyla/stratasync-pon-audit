@@ -34,6 +34,11 @@ SITE = "RMN2"
 DATA_HALLS = ("A", "B", "C", "D")
 F1_TAB = "RMN2 F1 & F2"
 
+# The audited network is XGS-PON. A meter set up to test several PON types at
+# once (signalSetup "gpon;xgspon") reports one result per type; only the
+# XGS-PON one is used.
+PON_SERVICE = "xgspon"
+
 
 def rack_tab(data_hall: str) -> str:
     return f"{SITE}.DH{data_hall} PON Audit"
@@ -229,7 +234,7 @@ def readings_from_result(doc: Mapping[str, Any], source: Optional[str] = None) -
         if test.get("type") != "truepon":
             continue
         config = test.get("configuration") or {}
-        signal = config.get("signalSetup")
+        signal = _pick_service(config.get("signalSetup"), source)
         signal_config = config.get(signal) or {}
         if signal_config.get("oltIdFormat", "hex") != "hex":
             raise ValueError(f"Unexpected oltIdFormat {signal_config.get('oltIdFormat')!r} in {source}")
@@ -256,6 +261,23 @@ def readings_from_result(doc: Mapping[str, Any], source: Optional[str] = None) -
     return readings
 
 
+def _pick_service(signal_setup: Optional[str], source: Optional[str]) -> Optional[str]:
+    """The signalSetup key holding the result to use (see PON_SERVICE)."""
+    services = (signal_setup or "").split(";")
+    if len(services) == 1:
+        return signal_setup
+    if PON_SERVICE in services:
+        return PON_SERVICE
+    raise ValueError(f"Test set up for {signal_setup!r}, which doesn't include {PON_SERVICE}, in {source}")
+
+
+def is_multi_service(record: Mapping[str, Any]) -> bool:
+    """True for a search result from a test of several PON types at once. Its
+    power, loss and OLT ID fields join one value per type with ";", so it is
+    read from the full file instead (see reading_from_search)."""
+    return ";" in str(record.get("ponServices") or "")
+
+
 def reading_from_search(record: Mapping[str, Any]) -> TestReading:
     """Build a reading from a StrataSync search result, without downloading the file.
 
@@ -263,7 +285,11 @@ def reading_from_search(record: Mapping[str, Any]) -> TestReading:
     636 downloaded files): power and loss as strings, the OLT ID already as
     hex text ("01 21 AA 09"), and the test time in the meter's time zone. It
     does not include the signal status, so `signal_status` is None.
+
+    Raises ValueError for a multi-service record (see is_multi_service).
     """
+    if is_multi_service(record):
+        raise ValueError(f"{record.get('name')} tested {record.get('ponServices')!r}; read the full file")
     tech_name = " ".join(p for p in (record.get("userFirstName"), record.get("userLastName")) if p)
     return TestReading(
         label=record.get("testLocationsLabel") or "",
