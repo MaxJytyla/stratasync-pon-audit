@@ -26,6 +26,22 @@ The builds aren't code-signed, which is why the first launch needs those extra s
 
 **Search from** is normally left blank. Each update then continues from where the last one finished. Enter a date (`2026-10-22`) or a date and time (`2026-10-22 08:00`) to look further back. Re-running over the same period is safe, because results older than what's already in the sheet are skipped.
 
+### Replacing a multi-drop cable
+
+All the racks on one row and channel of a data hall share one multi-drop cable (e.g. DHB row 5 channel A). When a cable is replaced, its old results no longer mean anything:
+
+1. Click **Replace cable…** and choose the data hall, row and channel. Set **Replaced at** to when the new cable went in (it defaults to now).
+2. Click **Preview**. A list shows every rack on that cable, with its current dBm and timestamp and what will happen to it. Nothing is changed yet.
+3. Click **Replace cable** and confirm.
+
+For each rack, the app clears `dBm in Port 1` (channel A) or `dBm in Port 2` (channel B), and sets `Timestamp P1`/`P2` to the replacement time. That timestamp *is* the record of the replacement. Every update after that ignores tests on that cable from before it, over any time window, on any computer, and with the command-line script too. These show in **Skipped** as "tested before cable replacement". The first test after the replacement is written as normal. Racks already tested after the replacement time are left alone, and so are racks with a later replacement already recorded. Nothing else in the sheet is touched (OLT, Issue, Fix and the History tabs included). The old values can only be recovered from the sheet's version history.
+
+F1 cables are separate and aren't covered by this.
+
+### Test times and reset meter clocks
+
+A result's time is the meter's **test time**, which is when the light was measured. A meter can sync hours later, and a test made on an old cable must still count as before its replacement. Some meters' clocks get reset (e.g. to 2020-12-31). If a test time is more than five years before the result's **sync time** (when StrataSync received it), the sync time is used instead. That applies when it's compared, and when it's written to the Timestamp column. Such results are marked "(sync time; meter clock said …)" in the report.
+
 ### Where the app keeps its data
 
 | | Folder |
@@ -57,7 +73,8 @@ The sheet must be a native Google Sheet. An `.xlsx` file uploaded to Drive won't
 
 - The value written is the downstream power in dBm. The sheet's own formulas grade it.
 - The OLT columns hold the *expected* port and are never overwritten. The measured OLT ID is compared against them.
-- A result with any problem is flagged and not written. Problems are an OLT mismatch, no OLT ID, an unrecognized OLT ID, no power reading, no expected OLT in the sheet, an unrecognized label, or no matching row. Issue columns are never touched.
+- A result with any problem is flagged and not written. Problems are an OLT mismatch, no OLT ID, an unrecognized OLT ID, no power reading, no expected OLT in the sheet, an unrecognized label, no matching row, no usable test time, or a test file that can't be read. Issue columns are never touched.
+- A meter set up to test GPON and XGS-PON at once reports both. Only the XGS-PON result is used.
 - If a location was tested more than once, the latest test wins.
 - If some full-file downloads fail, the results that did download are still written, but the download position doesn't move, so the next update retries.
 

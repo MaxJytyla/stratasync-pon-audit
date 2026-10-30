@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 SITE = "RMN2"
@@ -212,18 +212,62 @@ class TestReading:
     work_order_id: Optional[str]
     workflow_id: Optional[int]
     source: Optional[str] = None  # file name or StrataSync ID, for traceability
+    sync_time: Optional[str] = None  # when StrataSync received it, e.g. "2026-10-29T12:33:01Z"
 
     @property
     def location(self) -> Optional[Location]:
         return parse_location(self.label)
 
     @property
+    def uses_sync_time(self) -> bool:
+        """True when the meter's test time can't be trusted and the sync time is used.
+
+        Meters whose clock has been reset report test times years in the past
+        (e.g. 2020). A test time more than STALE_TEST_TIME before the sync time
+        is treated as such; otherwise the test time is used, because it is when
+        the light was actually measured (a meter can sync hours later).
+        """
+        synced = _parse_time(_utc_z(self.sync_time))
+        if synced is None:
+            return False
+        tested = _parse_time(self.test_time)
+        return tested is None or tested < synced - STALE_TEST_TIME
+
+    @property
+    def sheet_time(self) -> str:
+        """The test's time as written to the sheet and compared with it:
+        the test time, or the sync time if the test time is unreliable (in the
+        meter's time zone where known, so the column stays consistent)."""
+        if not self.uses_sync_time:
+            return self.test_time
+        synced = _parse_time(_utc_z(self.sync_time))
+        tested = _parse_time(self.test_time)
+        return synced.astimezone(tested.tzinfo if tested else None).isoformat(timespec="seconds")
+
+    @property
     def timestamp(self) -> datetime:
-        return datetime.fromisoformat(self.test_time)
+        stamp = _parse_time(self.sheet_time)
+        if stamp is None or stamp.tzinfo is None:
+            raise ValueError(f"{self.label or self.source}: no usable test time")
+        return stamp
 
 
-def readings_from_result(doc: Mapping[str, Any], source: Optional[str] = None) -> List[TestReading]:
-    """Extract TruePON readings from one test result document (.wfl.json)."""
+STALE_TEST_TIME = timedelta(days=5 * 365)
+
+
+def _utc_z(value: Optional[str]) -> Optional[str]:
+    return value.replace("Z", "+00:00") if value else value
+
+
+def readings_from_result(
+    doc: Mapping[str, Any], source: Optional[str] = None, sync_time: Optional[str] = None
+) -> List[TestReading]:
+    """Extract TruePON readings from one test result document (.wfl.json).
+
+    The file doesn't record when StrataSync received it; pass the search
+    result's syncTime so an unreliable test time can be replaced (see
+    TestReading.uses_sync_time).
+    """
     asset = doc.get("assetInfo") or {}
     workflow = doc.get("workflow") or {}
     tech = workflow.get("techInfo") or {}
@@ -256,6 +300,7 @@ def readings_from_result(doc: Mapping[str, Any], source: Optional[str] = None) -
                     work_order_id=workflow.get("workOrderId"),
                     workflow_id=loc.get("workflowId", workflow.get("workflowId")),
                     source=source,
+                    sync_time=sync_time,
                 )
             )
     return readings
@@ -304,6 +349,7 @@ def reading_from_search(record: Mapping[str, Any]) -> TestReading:
         work_order_id=record.get("workOrderId"),
         workflow_id=record.get("workflowId"),
         source=f"{record.get('name')} (id {record.get('_id')})",
+        sync_time=record.get("syncTime"),
     )
 
 
@@ -491,6 +537,7 @@ def plan_updates(
     * When a location was tested more than once, the latest test wins.
     * A reading is skipped when the sheet already has a result for that
       location with the same or a later timestamp (unless overwrite_newer).
+      This includes a cable replacement's timestamp (see plan_cable_replacement).
     * A reading with any problem (OLT mismatch, no OLT ID, no power reading,
       ...) is not written at all, only flagged, so nothing questionable
       reaches the sheet. Issue columns are never touched.
@@ -503,6 +550,12 @@ def plan_updates(
         if loc is None:
             plan.skipped.append((reading, "label not recognized"))
             plan.flags.append(Flag("unknown_label", f"Unrecognized test label {reading.label!r}", reading))
+            continue
+        try:
+            reading.timestamp
+        except ValueError as exc:
+            plan.skipped.append((reading, "no usable test time"))
+            plan.flags.append(Flag("no_test_time", str(exc), reading))
             continue
         slot = (loc.tab, loc.key, loc.columns)
         current = latest.get(slot)
@@ -527,7 +580,11 @@ def plan_updates(
 
         existing_time = _parse_time(index.get(row, index.column(cols.timestamp)))
         if existing_time and existing_time >= reading.timestamp and not overwrite_newer:
-            plan.skipped.append((reading, "sheet already has this or a newer result"))
+            if _is_blank(index.get(row, index.column(cols.power))):
+                why = f"tested before cable replacement ({index.get(row, index.column(cols.timestamp))})"
+            else:
+                why = "sheet already has this or a newer result"
+            plan.skipped.append((reading, why))
             continue
 
         problems = _reading_problems(reading, index.get(row, index.column(cols.expected_olt)))
@@ -538,9 +595,91 @@ def plan_updates(
 
         # Two updates per written reading, power then timestamp (see written_cells).
         plan.updates.append(CellUpdate(tab, row, index.column(cols.power), reading.power_dbm))
-        plan.updates.append(CellUpdate(tab, row, index.column(cols.timestamp), reading.test_time))
+        plan.updates.append(CellUpdate(tab, row, index.column(cols.timestamp), reading.sheet_time))
         plan.written.append(reading)
 
+    return plan
+
+
+# ---- Cable replacement ---------------------------------------------------------------
+#
+# All the racks on one row and channel of a data hall are fed by one multi-drop
+# cable. When it is replaced, its results are cleared from the sheet: each rack's
+# dBm is blanked and its timestamp set to the replacement time. That timestamp
+# is the only record of the replacement, and plan_updates' "sheet already has
+# a newer result" rule then ignores every test from before it, while the first
+# test after it is written as normal. (A timestamp with a blank dBm can only
+# come from a replacement, since flagged results aren't written.)
+#
+# The comparison is against the test time (see TestReading.sheet_time), so a
+# test made on the old cable but synced after the replacement is still ignored.
+# Only a test time that is clearly wrong (a reset meter clock) falls back to
+# the sync time.
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+@dataclass(frozen=True)
+class RackClearing:
+    rack: int
+    row: int  # sheet row
+    old_power: Any
+    old_timestamp: Any
+    cleared: bool  # False when the rack was already tested after the replacement
+    reason: str = ""
+
+
+@dataclass
+class CableReplacementPlan:
+    tab: str
+    data_hall: str
+    row: int
+    channel: str
+    replaced_at: str  # ISO 8601 with offset, as written to the sheet
+    racks: List[RackClearing] = field(default_factory=list)
+    updates: List[CellUpdate] = field(default_factory=list)
+
+    @property
+    def cable(self) -> str:
+        return f"{SITE}.DH{self.data_hall} row {self.row} channel {self.channel}"
+
+
+def plan_cable_replacement(
+    index: TabIndex, data_hall: str, row: int, channel: str, replaced_at: datetime
+) -> CableReplacementPlan:
+    """Cell updates that clear one cable's results and record its replacement time.
+
+    `index` is the data hall's audit tab. A rack already tested after the
+    replacement time is left alone, so a result from the new cable isn't lost;
+    so is one with a later replacement already recorded, so that protection
+    isn't weakened.
+    """
+    if channel not in RACK_COLUMNS:
+        raise ValueError(f"Channel must be A or B, not {channel!r}")
+    if replaced_at.tzinfo is None:
+        raise ValueError("The replacement time must include a time zone")
+    cols = RACK_COLUMNS[channel]
+    power_col, time_col = index.column(cols.power), index.column(cols.timestamp)
+    stamp = replaced_at.isoformat(timespec="seconds")
+    plan = CableReplacementPlan(index.title, data_hall, row, channel, stamp)
+
+    racks = sorted(((key[2], r) for key, r in index.rows.items() if key[0] == data_hall and key[1] == row),
+                   key=lambda kr: kr[1])
+    if not racks:
+        raise ValueError(f"Tab {index.title!r} has no racks on row {row}")
+    for rack, r in racks:
+        old_power, old_time = index.get(r, power_col), index.get(r, time_col)
+        existing = _parse_time(old_time)
+        if existing and existing > replaced_at:
+            reason = ("a later replacement is already recorded" if _is_blank(old_power)
+                      else "already tested after the replacement")
+            plan.racks.append(RackClearing(rack, r, old_power, old_time, False, reason))
+            continue
+        plan.racks.append(RackClearing(rack, r, old_power, old_time, True))
+        plan.updates.append(CellUpdate(index.title, r, power_col, ""))
+        plan.updates.append(CellUpdate(index.title, r, time_col, stamp))
     return plan
 
 

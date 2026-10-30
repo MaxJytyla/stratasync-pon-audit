@@ -18,18 +18,23 @@ import csv
 import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
-from .config import Settings, StrataSyncSettings, app_data_dir
+from .config import ConfigError, Settings, StrataSyncSettings, app_data_dir
 from .pon_audit import (
     AUDIT_TABS,
+    RACK_KEY_HEADERS,
+    CableReplacementPlan,
     Flag,
+    TabIndex,
     UpdatePlan,
     build_indexes,
     is_multi_service,
+    plan_cable_replacement,
     plan_updates,
+    rack_tab,
     reading_from_search,
     readings_from_result,
 )
@@ -130,7 +135,7 @@ def run_sync(
                                                  f"test file could not be read ({exc})"))
             continue
         try:
-            readings.extend(readings_from_result(doc, source=source))
+            readings.extend(readings_from_result(doc, source=source, sync_time=rec.get("syncTime")))
         except ValueError as exc:
             unreadable.append(Flag("unreadable", f"{rec.get('testLocationsLabel') or source}: {exc}"))
 
@@ -161,6 +166,40 @@ def run_sync(
     if state.last_sync_time:
         log(f"Saved download position: {state.last_sync_time.astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
     return result
+
+
+def replace_cable(
+    settings: Settings,
+    data_hall: str,
+    row: int,
+    channel: str,
+    replaced_at: datetime,
+    *,
+    apply: bool,
+    log: Log = print,
+) -> Tuple[str, CableReplacementPlan]:
+    """Plan (and if `apply`, write) the clearing of one cable's results.
+
+    Returns (sheet title, CableReplacementPlan). The sheet is read afresh each
+    time, so applying never relies on an earlier preview's values.
+    """
+    if replaced_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise ConfigError("The replacement time is in the future. Every test before it would be "
+                          "ignored, including tests of the new cable.")
+    writer = SheetWriter(settings)
+    tab = rack_tab(data_hall)
+    values = writer.read_tabs([tab]).get(tab)
+    if values is None:
+        raise ConfigError(f"Tab {tab!r} not found in '{writer.spreadsheet.title}'.")
+    plan = plan_cable_replacement(TabIndex.build(tab, values, RACK_KEY_HEADERS),
+                                  data_hall, row, channel, replaced_at)
+    cleared = sum(r.cleared for r in plan.racks)
+    if not apply:
+        return writer.spreadsheet.title, plan
+    n = writer.write_cells(plan.updates)
+    log(f"Cable replaced: {plan.cable} at {plan.replaced_at}. Cleared {cleared} rack(s) "
+        f"({n} cells) in '{tab}'" + (f", left {len(plan.racks) - cleared} alone" if cleared < len(plan.racks) else ""))
+    return writer.spreadsheet.title, plan
 
 
 FLAG_CSV_HEADER = ["kind", "label", "message", "test_time", "tech", "serial_no", "source"]

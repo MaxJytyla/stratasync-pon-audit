@@ -22,7 +22,8 @@ from .config import (
 )
 from .sheets import SheetAccessError
 from .stratasync import StrataSyncError
-from .sync import SyncResult, last_position, run_sync, write_flags_csv
+from .pon_audit import DATA_HALLS
+from .sync import SyncResult, last_position, replace_cable, run_sync, write_flags_csv
 
 PAD = 6
 
@@ -42,6 +43,24 @@ def _parse_since(text: str) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.astimezone()
 
 
+def _parse_when(text: str) -> datetime:
+    """A required date and time, in this computer's time zone unless one is given."""
+    text = text.strip()
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        dt = None
+    if dt is None or len(text) <= 10:
+        raise ConfigError("Enter the replacement time as a date and time, like 2026-10-30 14:30.")
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _shown_time(reading) -> str:
+    if reading.uses_sync_time:
+        return f"{reading.sheet_time} (sync time; meter clock said {reading.test_time or 'nothing'})"
+    return reading.test_time
+
+
 def _fmt_local(dt: Optional[datetime]) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S") if dt else "-"
 
@@ -55,7 +74,7 @@ def _error_text(exc: BaseException) -> str:
         elif exc.body:
             text += f"\n\n{str(exc.body)[:500]}"
         return text
-    if isinstance(exc, (ConfigError, SheetAccessError)):
+    if isinstance(exc, (ConfigError, SheetAccessError, ValueError)):
         return str(exc)
     return f"{type(exc).__name__}: {exc}"
 
@@ -153,6 +172,8 @@ class App(ttk.Frame):
 
         buttons = ttk.Frame(bar)
         buttons.grid(row=0, column=4, rowspan=2, sticky="e")
+        self.replace_btn = ttk.Button(buttons, text="Replace cable…", command=self._open_replace_dialog)
+        self.replace_btn.pack(side="left", padx=(0, PAD * 4))
         self.preview_btn = ttk.Button(buttons, text="Preview (no changes)", command=lambda: self._start(apply=False))
         self.preview_btn.pack(side="left")
         self.run_btn = ttk.Button(buttons, text="Run update", command=lambda: self._start(apply=True))
@@ -319,8 +340,8 @@ class App(ttk.Frame):
         self._clear_report()
         self.summary.configure(text="Running…" if apply else "Previewing…")
         self.tabs.select(3)
-        self.preview_btn.configure(state="disabled")
-        self.run_btn.configure(state="disabled")
+        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+            btn.configure(state="disabled")
         self.progress.start(12)
 
         def work():
@@ -340,6 +361,8 @@ class App(ttk.Frame):
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self._log(payload)
+                elif kind == "call":
+                    payload()
                 elif kind == "done":
                     self._finish()
                     self._show_result(payload)
@@ -354,9 +377,38 @@ class App(ttk.Frame):
 
     def _finish(self) -> None:
         self.progress.stop()
-        self.preview_btn.configure(state="normal")
-        self.run_btn.configure(state="normal")
+        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+            btn.configure(state="normal")
         self._update_position()
+
+    def background(self, work, on_done, on_error) -> bool:
+        """Run `work()` off the UI thread, then `on_done(result)` or `on_error(exc)`
+        on it. Returns False (and does nothing) if something is already running."""
+        if self.worker and self.worker.is_alive():
+            return False
+        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+            btn.configure(state="disabled")
+        self.progress.start(12)
+
+        def run():
+            try:
+                result = work()
+                self.events.put(("call", lambda: (self._finish(), on_done(result))))
+            except Exception as exc:  # shown to the user, not swallowed
+                self.events.put(("call", lambda exc=exc: (self._finish(), on_error(exc))))
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+        return True
+
+    def _open_replace_dialog(self) -> None:
+        try:
+            settings = make_settings(self.sheet_id.get(), self.key_text.get("1.0", "end"))
+        except ConfigError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        self._save_form()
+        CableDialog(self, settings)
 
     def _log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -384,7 +436,7 @@ class App(ttk.Frame):
         for reading, power, stamp in plan.written_cells():
             self.written_tree.insert("", "end", values=(
                 reading.label, power.tab, f"{power.a1}, {stamp.a1}", reading.power_dbm,
-                reading.test_time, reading.tech_name or "", reading.serial_no or ""))
+                _shown_time(reading), reading.tech_name or "", reading.serial_no or ""))
         for f in plan.flags:
             rd = f.reading
             self.flag_tree.insert("", "end", values=(
@@ -393,7 +445,7 @@ class App(ttk.Frame):
         # Flagged readings are listed in full on the Flagged tab.
         skipped = [(rd, why) for rd, why in plan.skipped if why != "flagged (not written)"]
         for rd, why in skipped:
-            self.skipped_tree.insert("", "end", values=(rd.label, why, rd.test_time))
+            self.skipped_tree.insert("", "end", values=(rd.label, why, _shown_time(rd)))
         self._set_tab_counts(len(plan.written), len(plan.flags), len(skipped))
         self.export_btn.configure(state="normal" if plan.flags else "disabled")
 
@@ -437,6 +489,130 @@ class App(ttk.Frame):
                 return
         self._save_form()
         self.root.destroy()
+
+
+class CableDialog(tk.Toplevel):
+    """Record a multi-drop cable replacement: clear the cable's results and block older tests."""
+
+    def __init__(self, app: App, settings):
+        super().__init__(app.root)
+        self.app, self.settings = app, settings
+        self.previewed = None  # the form values the current preview was made for
+        self.title("Replace cable")
+        self.transient(app.root)
+        self.minsize(640, 460)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        form = ttk.Frame(self, padding=PAD * 2)
+        form.grid(row=0, column=0, sticky="ew")
+        ttk.Label(form, text="Data hall:").grid(row=0, column=0, sticky="w")
+        self.data_hall = tk.StringVar(value=DATA_HALLS[0])
+        ttk.Combobox(form, textvariable=self.data_hall, values=DATA_HALLS, state="readonly",
+                     width=4).grid(row=0, column=1, sticky="w", padx=(PAD, PAD * 3))
+        ttk.Label(form, text="Row:").grid(row=0, column=2, sticky="w")
+        self.row = tk.StringVar()
+        ttk.Entry(form, textvariable=self.row, width=6).grid(row=0, column=3, sticky="w", padx=(PAD, PAD * 3))
+        ttk.Label(form, text="Channel:").grid(row=0, column=4, sticky="w")
+        self.channel = tk.StringVar(value="A")
+        for i, ch in enumerate("AB"):
+            ttk.Radiobutton(form, text=ch, value=ch, variable=self.channel).grid(row=0, column=5 + i, padx=(PAD, 0))
+
+        ttk.Label(form, text="Replaced at:").grid(row=1, column=0, sticky="w", pady=(PAD, 0))
+        self.when = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        ttk.Entry(form, textvariable=self.when, width=18).grid(row=1, column=1, columnspan=3, sticky="w",
+                                                               padx=(PAD, 0), pady=(PAD, 0))
+        offset = datetime.now().astimezone().strftime("%z")
+        ttk.Label(form, text=f"This computer's time (UTC{offset[:3]}:{offset[3:]}). Tests on this cable made "
+                             "before this time will be ignored.",
+                  foreground="gray", wraplength=600, justify="left").grid(row=2, column=0, columnspan=8, sticky="w")
+        ttk.Button(form, text="Preview", command=self._preview).grid(row=1, column=4, columnspan=3, sticky="w",
+                                                                    padx=(0, 0), pady=(PAD, 0))
+
+        self.status = ttk.Label(self, text="Choose the cable and click Preview to see which racks will be cleared.",
+                                wraplength=620, justify="left", padding=(PAD * 2, 0))
+        self.status.grid(row=1, column=0, sticky="ew")
+
+        frame = ttk.Frame(self, padding=(PAD * 2, PAD))
+        frame.grid(row=2, column=0, sticky="nsew")
+        self.tree = app._tree(frame, ("rack", "dbm", "time", "action"),
+                              ("Rack", "Current dBm", "Current timestamp", "Action"), (60, 100, 210, 250))
+
+        buttons = ttk.Frame(self, padding=PAD * 2)
+        buttons.grid(row=3, column=0, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left")
+        self.apply_btn = ttk.Button(buttons, text="Replace cable", command=self._apply, state="disabled")
+        self.apply_btn.pack(side="left", padx=(PAD, 0))
+
+        for var in (self.data_hall, self.row, self.channel, self.when):
+            var.trace_add("write", lambda *_: self._invalidate())
+
+    def _inputs(self):
+        try:
+            row = int(self.row.get().strip())
+        except ValueError:
+            raise ConfigError("Enter the row number.") from None
+        return self.data_hall.get(), row, self.channel.get(), _parse_when(self.when.get())
+
+    def _invalidate(self) -> None:
+        self.previewed = None
+        self.apply_btn.configure(state="disabled")
+
+    def _preview(self) -> None:
+        try:
+            inputs = self._inputs()
+        except ConfigError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        self.status.configure(text="Reading the sheet…")
+        if not self.app.background(lambda: replace_cable(self.settings, *inputs, apply=False),
+                                   lambda res: self._show_preview(inputs, *res), self._failed):
+            self.status.configure(text="Wait for the current run to finish, then click Preview again.")
+
+    def _show_preview(self, inputs, sheet_title, plan) -> None:
+        if not self.winfo_exists():
+            return
+        self.tree.delete(*self.tree.get_children())
+        for r in plan.racks:
+            action = f"clear, set timestamp to {plan.replaced_at}" if r.cleared else f"leave: {r.reason}"
+            self.tree.insert("", "end", values=(r.rack, r.old_power or "", r.old_timestamp or "", action))
+        cleared = sum(r.cleared for r in plan.racks)
+        self.status.configure(text=(
+            f"{plan.cable} in '{sheet_title}': {len(plan.racks)} rack(s), {cleared} to clear. "
+            "Nothing has been changed yet."))
+        self.previewed = (inputs, sheet_title, plan.cable, plan.replaced_at, cleared)
+        self.apply_btn.configure(state="normal" if cleared else "disabled")
+
+    def _apply(self) -> None:
+        if not self.previewed:
+            return
+        inputs, sheet_title, cable, stamp, cleared = self.previewed
+        if not messagebox.askyesno(APP_NAME, (
+                f"Replace {cable} in '{sheet_title}'?\n\n"
+                f"The dBm of {cleared} rack(s) will be cleared and their timestamps set to {stamp}. "
+                "Tests on this cable from before that time will be ignored from now on.\n\n"
+                "The old values can only be recovered from the sheet's version history."),
+                icon="warning", parent=self):
+            return
+        self.status.configure(text="Writing…")
+        self.app.background(
+            lambda: replace_cable(self.settings, *inputs, apply=True,
+                                  log=lambda msg: self.app.events.put(("log", msg))),
+            self._applied, self._failed)
+
+    def _applied(self, res) -> None:
+        sheet_title, plan = res
+        cleared = sum(r.cleared for r in plan.racks)
+        messagebox.showinfo(APP_NAME, f"Replaced {plan.cable}: cleared {cleared} rack(s) in '{sheet_title}'.",
+                            parent=self if self.winfo_exists() else self.app.root)
+        if self.winfo_exists():
+            self.destroy()
+
+    def _failed(self, exc) -> None:
+        self.app._log(f"Error: {_error_text(exc)}")
+        if self.winfo_exists():
+            self.status.configure(text="Failed; see the message.")
+        messagebox.showerror(APP_NAME, _error_text(exc), parent=self if self.winfo_exists() else self.app.root)
 
 
 def main() -> None:
