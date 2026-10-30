@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -20,10 +22,9 @@ from .config import (
     make_stratasync_settings,
     parse_service_account,
 )
-from .sheets import SheetAccessError
-from .stratasync import StrataSyncError
+from . import history, scheduler
 from .pon_audit import DATA_HALLS
-from .sync import SyncResult, last_position, replace_cable, run_sync, write_flags_csv
+from .sync import SyncResult, error_text as _error_text, last_position, replace_cable, run_sync, write_flags_csv
 
 PAD = 6
 
@@ -65,18 +66,19 @@ def _fmt_local(dt: Optional[datetime]) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S") if dt else "-"
 
 
-def _error_text(exc: BaseException) -> str:
-    if isinstance(exc, StrataSyncError):
-        text = str(exc)
-        if exc.status in (400, 401) and "Token" in text:
-            text += ("\n\nCheck the client ID and secret, and that the right region "
-                     "(USA or EU) is selected.")
-        elif exc.body:
-            text += f"\n\n{str(exc.body)[:500]}"
-        return text
-    if isinstance(exc, (ConfigError, SheetAccessError, ValueError)):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
+def _fmt_iso(value: str) -> str:
+    try:
+        return _fmt_local(datetime.fromisoformat(value))
+    except ValueError:
+        return value
+
+
+def _open_folder(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        os.startfile(path)  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
 
 class App(ttk.Frame):
@@ -87,20 +89,25 @@ class App(ttk.Frame):
         self.result: Optional[SyncResult] = None
         self.events: "queue.Queue[tuple]" = queue.Queue()
         self.worker: Optional[threading.Thread] = None
+        self.history_mtime = -1.0
+        self.polls = 0
+        self.warned_no_secrets = False
 
         root.title(APP_NAME)
-        root.minsize(900, 680)
+        root.minsize(900, 760)
         self.grid(sticky="nsew")
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.rowconfigure(4, weight=1)
 
         self._build_stratasync()
         self._build_google()
+        self._build_schedule()
         self._build_actions()
         self._build_report()
         self._load_form()
+        self._refresh_history()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
 
@@ -155,9 +162,34 @@ class App(ttk.Frame):
         self.key_status = ttk.Label(key_frame, text="", foreground="gray")
         self.key_status.grid(row=1, column=0, columnspan=2, sticky="w")
 
+    def _build_schedule(self) -> None:
+        box = ttk.LabelFrame(self, text="Automatic updates", padding=PAD)
+        box.grid(row=2, column=0, sticky="ew", pady=(PAD, 0))
+        box.columnconfigure(4, weight=1)
+
+        ttk.Label(box, text="Run update every").grid(row=0, column=0, sticky="w")
+        self.every = tk.StringVar(value="1")
+        ttk.Spinbox(box, from_=1, to=999, textvariable=self.every, width=5).grid(row=0, column=1, padx=(PAD, 0))
+        self.every_unit = tk.StringVar(value="hours")
+        ttk.Combobox(box, textvariable=self.every_unit, values=("minutes", "hours"), state="readonly",
+                     width=8).grid(row=0, column=2, padx=(PAD, 0))
+        buttons = ttk.Frame(box)
+        buttons.grid(row=0, column=3, sticky="w", padx=(PAD * 2, 0))
+        self.schedule_btn = ttk.Button(buttons, text="Turn on", command=self._turn_on_schedule)
+        self.schedule_btn.pack(side="left")
+        self.unschedule_btn = ttk.Button(buttons, text="Turn off", command=self._turn_off_schedule)
+        self.unschedule_btn.pack(side="left", padx=(PAD, 0))
+        ttk.Button(box, text="Open history folder", command=lambda: _open_folder(history.history_dir())
+                   ).grid(row=0, column=5, sticky="e")
+        self.schedule_status = ttk.Label(box, text="", foreground="gray", wraplength=840, justify="left")
+        self.schedule_status.grid(row=1, column=0, columnspan=6, sticky="w", pady=(PAD, 0))
+        if not scheduler.supported():
+            for w in (self.schedule_btn, self.unschedule_btn):
+                w.configure(state="disabled")
+
     def _build_actions(self) -> None:
         bar = ttk.Frame(self)
-        bar.grid(row=2, column=0, sticky="ew", pady=(PAD * 2, PAD))
+        bar.grid(row=3, column=0, sticky="ew", pady=(PAD * 2, PAD))
         bar.columnconfigure(3, weight=1)
 
         ttk.Label(bar, text="Search from:").grid(row=0, column=0, sticky="w")
@@ -183,7 +215,7 @@ class App(ttk.Frame):
 
     def _build_report(self) -> None:
         box = ttk.LabelFrame(self, text="Report", padding=PAD)
-        box.grid(row=3, column=0, sticky="nsew")
+        box.grid(row=4, column=0, sticky="nsew")
         box.columnconfigure(0, weight=1)
         box.rowconfigure(1, weight=1)
 
@@ -225,6 +257,18 @@ class App(ttk.Frame):
         self.log_text.configure(yscrollcommand=scroll.set)
         self.tabs.add(log_frame, text="Log")
 
+        history_frame = ttk.Frame(self.tabs)
+        self.history_tree = self._tree(
+            history_frame, ("time", "trigger", "status", "written", "flagged", "details"),
+            ("Update at", "Started", "Outcome", "Written", "Flagged", "Details"),
+            (150, 80, 70, 60, 60, 400))
+        ttk.Label(history_frame, text="Every update that wrote to the sheet, including automatic ones. "
+                                      "The flagged and written results of each are in flagged.csv and "
+                                      "written.csv in the history folder.",
+                  foreground="gray", wraplength=820, justify="left").grid(row=1, column=0, columnspan=2,
+                                                                          sticky="w", pady=(PAD, 0))
+        self.tabs.add(history_frame, text="History")
+
     def _tree_tab(self, title, cols, headings, widths) -> ttk.Treeview:
         frame = ttk.Frame(self.tabs)
         tree = self._tree(frame, cols, headings, widths)
@@ -254,6 +298,12 @@ class App(ttk.Frame):
         self.sheet_id.set(s.sheet_id)
         self.key_text.insert("1.0", s.service_account_json)
         self.remember.set(s.remember_secrets)
+        if s.auto_update_minutes % 60:
+            self.every.set(str(s.auto_update_minutes))
+            self.every_unit.set("minutes")
+        else:
+            self.every.set(str(s.auto_update_minutes // 60))
+            self.every_unit.set("hours")
         self._update_key_status()
         self._update_position()
         for var in (self.region, self.client_id, self.sheet_id):
@@ -267,13 +317,121 @@ class App(ttk.Frame):
             service_account_json=self.key_text.get("1.0", "end").strip(),
             sheet_id=self.sheet_id.get().strip(),
             remember_secrets=self.remember.get(),
+            auto_update_minutes=self._interval_minutes(strict=False),
         )
+
+    def _interval_minutes(self, strict: bool = True) -> int:
+        try:
+            n = int(self.every.get().strip())
+        except ValueError:
+            if strict:
+                raise ConfigError("Enter how often to run the update, as a whole number.") from None
+            return self.saved.auto_update_minutes
+        return n * (60 if self.every_unit.get() == "hours" else 1)
 
     def _save_form(self) -> None:
         try:
-            self._form().save()
+            form = self._form()
+            form.save()
         except OSError as exc:
             self._log(f"Could not save settings: {exc}")
+            return
+        if not form.remember_secrets and self._schedule() and not self.warned_no_secrets:
+            self.warned_no_secrets = True
+            messagebox.showwarning(APP_NAME, (
+                "Automatic updates are on, but 'Remember client secret and Google key on this computer' "
+                "is not ticked, so they can't sign in and will fail. Tick it, or turn automatic updates off."),
+                parent=self.root)
+
+    # ---- automatic updates ------------------------------------------------------
+
+    def _schedule(self) -> Optional[scheduler.Schedule]:
+        try:
+            return scheduler.current()
+        except OSError:
+            return None
+
+    def _update_schedule_status(self) -> None:
+        if not scheduler.supported():
+            self.schedule_status.configure(text="Automatic updates are only available on Windows and macOS.")
+            return
+        sched = self._schedule()
+        if sched is None:
+            lines = ["Off. Updates only run when you click Run update."]
+        elif not sched.minutes:
+            lines = ["On, but set up in a way this app doesn't recognise. Turn on again to replace it."]
+        else:
+            lines = [f"On: every {scheduler.describe(sched.minutes)} while you're signed in to this computer, "
+                     "with the settings saved here."]
+            if not sched.is_current_app:
+                lines.append("It starts a different copy of this app (" + sched.command[0] +
+                             "). Click Turn on to use this one.")
+        last = next((r for r in history.recent_runs() if r.get("trigger") == history.AUTOMATIC), None)
+        if last:
+            outcome = last.get("status", "")
+            if outcome in ("ok", "partial"):
+                outcome = f"wrote {last.get('written')}, flagged {last.get('flagged')}" + (
+                    " (some downloads failed; will retry)" if outcome == "partial" else "")
+            else:
+                outcome = f"{outcome}: {last.get('message', '')}"
+            lines.append(f"Last automatic update: {_fmt_iso(last.get('run_at', ''))}, {outcome}")
+        self.schedule_status.configure(text="\n".join(lines),
+                                       foreground="#b00020" if last and last.get("status") == "failed" else "gray")
+        self.unschedule_btn.configure(state="normal" if sched else "disabled")
+        self.schedule_btn.configure(text="Update" if sched and sched.is_current_app else "Turn on")
+
+    def _turn_on_schedule(self) -> None:
+        try:
+            minutes = self._interval_minutes()
+            make_stratasync_settings(self.region.get(), self.client_id.get(), self.client_secret.get())
+            make_settings(self.sheet_id.get(), self.key_text.get("1.0", "end"))
+        except ConfigError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        if not self.remember.get():
+            messagebox.showerror(APP_NAME, (
+                "Automatic updates run without this window, so they need the client secret and Google key "
+                "saved on this computer. Tick 'Remember client secret and Google key on this computer' first."),
+                parent=self.root)
+            return
+        self._save_form()
+        try:
+            scheduler.install(minutes)
+        except (ConfigError, OSError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        self._log(f"Automatic updates on: every {scheduler.describe(minutes)}")
+        self._update_schedule_status()
+        messagebox.showinfo(APP_NAME, (
+            f"Run update will happen every {scheduler.describe(minutes)}, starting "
+            f"{scheduler.describe(minutes)} from now, while you're signed in to this computer and "
+            "it's awake. The app doesn't need to be open.\n\n"
+            "It uses the settings saved here; changes you make in this window are used from the next "
+            "update on. Every update, with its flagged results, is recorded on the History tab and in "
+            "the history folder."), parent=self.root)
+
+    def _turn_off_schedule(self) -> None:
+        try:
+            scheduler.remove()
+        except (ConfigError, OSError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        self._log("Automatic updates off")
+        self._update_schedule_status()
+
+    def _refresh_history(self) -> None:
+        """Reload the History tab if runs.csv has changed (e.g. after an automatic update)."""
+        mtime = history.runs_mtime()
+        if mtime == self.history_mtime:
+            return
+        self.history_mtime = mtime
+        self.history_tree.delete(*self.history_tree.get_children())
+        for r in history.recent_runs():
+            self.history_tree.insert("", "end", values=(
+                _fmt_iso(r.get("run_at", "")), r.get("trigger", ""), r.get("status", ""),
+                r.get("written", ""), r.get("flagged", ""), r.get("message", "")))
+        self._update_position()
+        self._update_schedule_status()
 
     def _load_key_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -373,6 +531,9 @@ class App(ttk.Frame):
                     messagebox.showerror(APP_NAME, _error_text(payload), parent=self.root)
         except queue.Empty:
             pass
+        self.polls += 1
+        if self.polls % 50 == 0:  # every ~5 s
+            self._refresh_history()
         self.after(100, self._poll)
 
     def _finish(self) -> None:
@@ -380,6 +541,7 @@ class App(ttk.Frame):
         for btn in (self.replace_btn, self.preview_btn, self.run_btn):
             btn.configure(state="normal")
         self._update_position()
+        self._refresh_history()
 
     def background(self, work, on_done, on_error) -> bool:
         """Run `work()` off the UI thread, then `on_done(result)` or `on_error(exc)`

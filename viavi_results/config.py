@@ -127,6 +127,7 @@ class SavedForm:
     service_account_json: str = ""
     sheet_id: str = ""
     remember_secrets: bool = True
+    auto_update_minutes: int = 60
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "SavedForm":

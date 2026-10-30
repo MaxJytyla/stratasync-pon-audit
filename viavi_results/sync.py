@@ -10,18 +10,26 @@ Full files are only downloaded for tests with no power reading, to get the
 signal status for the flag message.
 
 Nothing is written, and the saved position doesn't move, unless `apply` is set.
+Every applied run is recorded in the update history (see history.py).
+
+Only one run at a time, per computer: a run holds `run_lock()`, so an automatic
+update and one started from the window can't overlap (VIAVI allows only one
+valid token per client ID, and both would move the same download position).
 """
 
 from __future__ import annotations
 
 import csv
 import hashlib
+import sys
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
+from . import history
 from .config import ConfigError, Settings, StrataSyncSettings, app_data_dir
 from .pon_audit import (
     AUDIT_TABS,
@@ -38,13 +46,60 @@ from .pon_audit import (
     reading_from_search,
     readings_from_result,
 )
-from .sheets import SheetWriter
+from .sheets import SheetAccessError, SheetWriter
 from .stratasync import SYNC_TIME, StrataSyncClient, StrataSyncError
 from .sync_state import SyncState
 
 TEST_TYPE = "truepon"
 
 Log = Callable[[str], None]
+
+
+class RunInProgress(ConfigError):
+    """Raised when another update (in the window or an automatic one) is already running."""
+
+
+@contextmanager
+def run_lock() -> Iterator[None]:
+    """Hold the per-computer update lock, or raise RunInProgress.
+
+    An OS file lock, so it's released even if the process is killed.
+    """
+    path = app_data_dir() / "run.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as fh:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RunInProgress("Another update is running on this computer (perhaps an automatic one). "
+                                "Try again in a minute.") from None
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def error_text(exc: BaseException) -> str:
+    """A readable message for a failed run."""
+    if isinstance(exc, StrataSyncError):
+        text = str(exc)
+        if exc.status in (400, 401) and "Token" in text:
+            text += ("\n\nCheck the client ID and secret, and that the right region "
+                     "(USA or EU) is selected.")
+        elif exc.body:
+            text += f"\n\n{str(exc.body)[:500]}"
+        return text
+    if isinstance(exc, (ConfigError, SheetAccessError, ValueError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 @dataclass
@@ -85,11 +140,33 @@ def run_sync(
     apply: bool,
     since: Optional[datetime] = None,
     log: Log = print,
+    trigger: str = history.MANUAL,
 ) -> SyncResult:
     """Search StrataSync, plan the sheet updates and (if `apply`) write them.
 
-    Raises ConfigError, StrataSyncError or SheetAccessError on failure.
+    Applied runs, and their failures, are recorded in the history under `trigger`.
+    Raises RunInProgress, ConfigError, StrataSyncError or SheetAccessError on failure.
     """
+    with run_lock():
+        if not apply:
+            return _run_sync(ss, settings, apply=False, since=since, log=log)
+        try:
+            result = _run_sync(ss, settings, apply=True, since=since, log=log)
+        except Exception as exc:
+            history.record_status(trigger, "failed", settings.sheet_id, error_text(exc), log)
+            raise
+        history.record_run(result, trigger, log)
+        return result
+
+
+def _run_sync(
+    ss: StrataSyncSettings,
+    settings: Settings,
+    *,
+    apply: bool,
+    since: Optional[datetime],
+    log: Log,
+) -> SyncResult:
     path = state_file(ss, settings)
     state = SyncState.load(path)
     run_at = datetime.now(timezone.utc)
@@ -186,6 +263,12 @@ def replace_cable(
     if replaced_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise ConfigError("The replacement time is in the future. Every test before it would be "
                           "ignored, including tests of the new cable.")
+    with run_lock():
+        return _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log)
+
+
+def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, replaced_at: datetime,
+                   *, apply: bool, log: Log) -> Tuple[str, CableReplacementPlan]:
     writer = SheetWriter(settings)
     tab = rack_tab(data_hall)
     values = writer.read_tabs([tab]).get(tab)
@@ -202,14 +285,11 @@ def replace_cable(
     return writer.spreadsheet.title, plan
 
 
-FLAG_CSV_HEADER = ["kind", "label", "message", "test_time", "tech", "serial_no", "source"]
+FLAG_CSV_HEADER = history.FLAG_FIELDS
 
 
 def write_flags_csv(plan: UpdatePlan, path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(FLAG_CSV_HEADER)
-        for f in plan.flags:
-            r = f.reading
-            w.writerow([f.kind, r and r.label, f.message, r and r.test_time,
-                        r and r.tech_name, r and r.serial_no, r and r.source])
+        w.writerows(history.flag_row(f) for f in plan.flags)
