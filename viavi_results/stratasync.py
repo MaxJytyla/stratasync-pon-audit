@@ -1,0 +1,370 @@
+"""Client for the StrataSync TPA Test Results JSON API (v1).
+
+Reference: "StrataSync TPA Test Results JSON API Developer Guide" (May 2023).
+
+Auth: POST {base_url}/oauth/token with client credentials returns a bearer
+token (valid ~15 minutes; typically only one valid token per client ID, so we
+cache and reuse it). Search: POST {base_url}/api/v1/testresults/search.
+
+Search constraints from the guide:
+  * createdOn or syncTime is required unless filtering by workflowId or _id.
+  * Each date range must cover at most a 24-hour period, so multi-day
+    queries are split into one request per day.
+  * Response fields vary by test type and firmware; never assume a fixed set.
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import threading
+import time
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from .config import StrataSyncSettings
+
+TOKEN_PATH = "/oauth/token"
+SEARCH_PATH = "/api/v1/testresults/search"
+
+# Values for DateRange.dateFilter (guide p.22).
+TODAY = -1
+TOMORROW = -2
+YESTERDAY = -3
+PREV_1_DAY = -61
+
+# Date fields that can be searched on.
+CREATED_ON = "createdOn"
+SYNC_TIME = "syncTime"
+
+# StrataSync rejects a respFields list that omits these.
+REQUIRED_RESP_FIELDS = ("assetType", "result")
+
+# Refresh the token this many seconds before it actually expires.
+_TOKEN_MARGIN_S = 60
+
+# Longest span one search may cover (the API allows at most 24 hours).
+_MAX_WINDOW = timedelta(hours=24) - timedelta(seconds=1)
+
+DateLike = Union[str, date, datetime]
+
+
+class StrataSyncError(RuntimeError):
+    """Raised when the API returns an error or an unexpected response."""
+
+    def __init__(self, message: str, status: Optional[int] = None, body: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+def _fmt_date(value: DateLike) -> str:
+    """Format a date/datetime as the ISO 8601 string the API expects."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError("datetime values must be timezone-aware (API needs a TZD)")
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def date_range(
+    start: Optional[DateLike] = None,
+    end: Optional[DateLike] = None,
+    date_filter: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build a DateRange object. `date_filter` takes precedence over start/end."""
+    if date_filter is not None:
+        return {"dateFilter": date_filter}
+    if start is None and end is None:
+        raise ValueError("Provide start and/or end, or a date_filter")
+    rng: Dict[str, Any] = {}
+    if start is not None:
+        rng["startDate"] = _fmt_date(start)
+    if end is not None:
+        rng["endDate"] = _fmt_date(end)
+    return rng
+
+
+class StrataSyncClient:
+    def __init__(self, settings: StrataSyncSettings, timeout: float = 60.0):
+        self._settings = settings
+        self._timeout = timeout
+        self._token: Optional[str] = settings.access_token
+        # A token supplied directly has an unknown expiry; treat it as valid
+        # until the server says otherwise.
+        self._token_expires_at = float("inf") if self._token else 0.0
+        # The client may be shared by download threads. Only one valid token
+        # exists per client ID, so token renewal is serialized: otherwise each
+        # thread's renewal would cancel the token the others are using.
+        self._token_lock = threading.Lock()
+
+        self._session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),  # search is read-only
+            respect_retry_after_header=True,
+        )
+        self._session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
+
+    # ---- auth -------------------------------------------------------------
+
+    @property
+    def _can_refresh(self) -> bool:
+        return bool(self._settings.client_id and self._settings.client_secret)
+
+    def request_token(self) -> Dict[str, Any]:
+        """Request a new access token with the client credentials.
+
+        Returns the raw token response (access_token, token_type, expires_in,
+        scope) and makes the new token the one this client uses.
+        """
+        if not self._can_refresh:
+            raise StrataSyncError(
+                "A client ID and client secret are required to request a token"
+            )
+        resp = self._session.post(
+            self._settings.base_url + TOKEN_PATH,
+            data={
+                "grant_type": "client_credentials",
+                "scope": "",
+                "client_id": self._settings.client_id,
+                "client_secret": self._settings.client_secret,
+            },
+            headers={"Accept": "application/json"},
+            timeout=self._timeout,
+        )
+        if resp.status_code != 200:
+            raise StrataSyncError(
+                f"Token request failed: HTTP {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text,
+            )
+        try:
+            body = resp.json()
+            token = body["access_token"]
+        except (ValueError, KeyError, TypeError):
+            raise StrataSyncError(
+                "Token response did not contain an access_token", status=200, body=resp.text
+            )
+        self._token = token
+        expires_in = float(body.get("expires_in", 900))
+        self._token_expires_at = time.monotonic() + max(expires_in - _TOKEN_MARGIN_S, 0)
+        return body
+
+    def _bearer(self, force_refresh: bool = False, rejected: Optional[str] = None) -> str:
+        """The current token, renewed if expired. `force_refresh` (after a 401)
+        renews it only if `rejected` is still the current token; if another
+        thread already renewed it, the new one is reused."""
+        with self._token_lock:
+            expired = time.monotonic() >= self._token_expires_at
+            still_rejected = force_refresh and (rejected is None or rejected == self._token)
+            if self._can_refresh and (still_rejected or expired or not self._token):
+                self.request_token()
+            if not self._token:
+                raise StrataSyncError("No access token available")
+            return self._token
+
+    # ---- search -----------------------------------------------------------
+
+    def search(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """POST a raw search query and return the list of result records."""
+        body = self._post_json(SEARCH_PATH, query)
+        if body.get("type") != "success":
+            raise StrataSyncError(
+                f"Search failed: {body.get('message') or body}",
+                status=body.get("httpStatus"),
+                body=body,
+            )
+        return list(body.get("result") or [])
+
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = self._settings.base_url + path
+        token = None
+        for attempt in (1, 2):
+            token = self._bearer(force_refresh=attempt == 2, rejected=token)
+            resp = self._session.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+                timeout=self._timeout,
+            )
+            # On 401, refresh the token once (if we can) and retry.
+            if resp.status_code == 401 and attempt == 1 and self._can_refresh:
+                continue
+            break
+
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if resp.status_code != 200 or not isinstance(body, dict):
+            message = body.get("message") if isinstance(body, dict) else resp.text[:500]
+            hint = ""
+            if resp.status_code == 401 and not self._can_refresh:
+                hint = " (access token may have expired; tokens last ~15 minutes)"
+            raise StrataSyncError(
+                f"HTTP {resp.status_code} from {path}: {message}{hint}",
+                status=resp.status_code,
+                body=body if body is not None else resp.text,
+            )
+        return body
+
+    def search_results(
+        self,
+        created_on: Optional[Dict[str, Any]] = None,
+        sync_time: Optional[Dict[str, Any]] = None,
+        *,
+        test_type: Optional[str] = None,
+        result: Optional[str] = None,
+        work_order_id: Optional[str] = None,
+        workflow_id: Optional[int] = None,
+        tech_id: Optional[str] = None,
+        unique_id: Optional[str] = None,
+        asset_type: Optional[str] = None,
+        name: Optional[str] = None,
+        full_org_path: Optional[str] = None,
+        file_format: Optional[str] = None,
+        resp_fields: Optional[Sequence[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search with named filters. Date ranges come from `date_range()`.
+
+        `resp_fields` limits returned fields; the required ones are added
+        automatically. `extra` passes any additional raw query keys.
+        """
+        if created_on is None and sync_time is None and workflow_id is None:
+            raise ValueError("created_on or sync_time is required unless workflow_id is given")
+
+        query: Dict[str, Any] = {}
+        optional = {
+            CREATED_ON: created_on,
+            SYNC_TIME: sync_time,
+            "type": test_type,
+            "result": result,
+            "workOrderId": work_order_id,
+            "workflowId": int(workflow_id) if workflow_id is not None else None,
+            "techId": tech_id,
+            "uniqueId": unique_id,
+            "assetType": asset_type,
+            "name": name,
+            "fullOrgPath": full_org_path,
+            "format": file_format,
+        }
+        query.update({k: v for k, v in optional.items() if v is not None})
+        if resp_fields is not None:
+            fields = list(resp_fields)
+            if fields:
+                fields += [f for f in REQUIRED_RESP_FIELDS if f not in fields]
+            query["respFields"] = fields
+        if extra:
+            query.update(extra)
+        return self.search(query)
+
+    def search_days(
+        self,
+        start: date,
+        end: date,
+        *,
+        by: str = CREATED_ON,
+        **filters: Any,
+    ) -> List[Dict[str, Any]]:
+        """Search every day from `start` to `end` inclusive (UTC days).
+
+        The API only accepts 24-hour windows, so this issues one request per
+        day and de-duplicates results by `_id`.
+        """
+        if by not in (CREATED_ON, SYNC_TIME):
+            raise ValueError(f"by must be {CREATED_ON!r} or {SYNC_TIME!r}")
+        if end < start:
+            raise ValueError("end must not be before start")
+
+        seen: Dict[Any, Dict[str, Any]] = {}
+        for day in _days(start, end):
+            rng = date_range(day, day)
+            kwargs = {"created_on": rng} if by == CREATED_ON else {"sync_time": rng}
+            for rec in self.search_results(**kwargs, **filters):
+                seen.setdefault(rec.get("_id"), rec)
+        return list(seen.values())
+
+    def search_workflow(self, workflow_id: int, **filters: Any) -> List[Dict[str, Any]]:
+        """All results for one workflow ID (no date range needed)."""
+        return self.search_results(workflow_id=workflow_id, **filters)
+
+    def search_between(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        by: str = SYNC_TIME,
+        **filters: Any,
+    ) -> List[Dict[str, Any]]:
+        """Search an arbitrary time span, split into windows under 24 hours.
+
+        Both ends are inclusive and must be timezone-aware. Results are
+        de-duplicated by `_id`.
+        """
+        if by not in (CREATED_ON, SYNC_TIME):
+            raise ValueError(f"by must be {CREATED_ON!r} or {SYNC_TIME!r}")
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("start and end must be timezone-aware")
+        seen: Dict[Any, Dict[str, Any]] = {}
+        window_start = start
+        while window_start <= end:
+            window_end = min(window_start + _MAX_WINDOW, end)
+            rng = date_range(window_start, window_end)
+            kwargs = {"created_on": rng} if by == CREATED_ON else {"sync_time": rng}
+            for rec in self.search_results(**kwargs, **filters):
+                seen.setdefault(rec.get("_id"), rec)
+            window_start = window_end + timedelta(seconds=1)
+        return list(seen.values())
+
+    # ---- download ---------------------------------------------------------
+
+    def download_contents(self, test_id: Union[int, str]) -> bytes:
+        """Download the raw test data file for a search result's `_id`."""
+        path = f"/api/v1/testresults/{int(test_id)}/contents"
+        token = None
+        for attempt in (1, 2):
+            token = self._bearer(force_refresh=attempt == 2, rejected=token)
+            resp = self._session.get(
+                self._settings.base_url + path,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=self._timeout,
+            )
+            if resp.status_code == 401 and attempt == 1 and self._can_refresh:
+                continue
+            break
+        if resp.status_code != 200:
+            raise StrataSyncError(
+                f"HTTP {resp.status_code} downloading test {test_id}: {resp.text[:300]}",
+                status=resp.status_code,
+                body=resp.text,
+            )
+        return resp.content
+
+    def download_json(self, test_id: Union[int, str]) -> Dict[str, Any]:
+        """Download a JSON test data file (e.g. a TruePON .wfl.json) and parse it."""
+        content = self.download_contents(test_id)
+        try:
+            return json.loads(content)
+        except ValueError:
+            # Some files are stored gzipped (format application/zip / .json.gz).
+            return json.loads(gzip.decompress(content))
+
+
+def _days(start: date, end: date) -> Iterable[date]:
+    day = start
+    while day <= end:
+        yield day
+        day += timedelta(days=1)

@@ -1,0 +1,18 @@
+# Build output
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Never commit credentials or exported flags
+*service_account*.json
+flagged*.csv
+
+# OS clutter
+.DS_Store
+Thumbs.db
