@@ -16,3 +16,6 @@ flagged*.csv
 # OS clutter
 .DS_Store
 Thumbs.db
+
+# Rust
+target/

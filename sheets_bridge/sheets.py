@@ -1,13 +1,15 @@
-"""Read and write a Google Sheet (any number of tabs) using a service account."""
+"""Read and write a Google Sheet (any number of tabs) using a service account.
+
+This is the same gspread code the Python app used. The Rust app reaches it
+through the bridge in __main__.py.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import gspread
 from google.oauth2.service_account import Credentials
-
-from .config import Settings
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -22,17 +24,17 @@ class SheetAccessError(RuntimeError):
 class SheetWriter:
     """Batch reads and cell writes across the tabs of one spreadsheet."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, service_account_info: Mapping[str, Any], sheet_id: str):
         creds = Credentials.from_service_account_info(
-            settings.service_account_info, scopes=SCOPES
+            dict(service_account_info), scopes=SCOPES
         )
         self._client = gspread.authorize(creds)
-        email = settings.service_account_info.get("client_email", "the service account")
+        email = service_account_info.get("client_email", "the service account")
         try:
-            self._spreadsheet = self._client.open_by_key(settings.sheet_id)
+            self._spreadsheet = self._client.open_by_key(sheet_id)
         except gspread.SpreadsheetNotFound:
             raise SheetAccessError(
-                f"Spreadsheet {settings.sheet_id} not found, or not shared with {email}. "
+                f"Spreadsheet {sheet_id} not found, or not shared with {email}. "
                 "Check the sheet ID and share the sheet with that address as an Editor."
             ) from None
         except gspread.exceptions.APIError as exc:
@@ -75,13 +77,13 @@ class SheetWriter:
         return out
 
     def write_cells(self, updates: Iterable[Any], value_input_option: str = "RAW") -> int:
-        """Write single-cell updates (objects with tab, a1 and value). Returns cells written.
+        """Write single-cell updates (dicts with tab, a1 and value). Returns cells written.
 
         RAW stores values exactly as given: numbers stay numbers and ISO
         timestamps stay text, matching what the sheet already holds.
         """
         data = [
-            {"range": f"{_quote(u.tab)}!{u.a1}", "values": [[u.value]]}
+            {"range": f"{_quote(u['tab'])}!{u['a1']}", "values": [[u["value"]]]}
             for u in updates
         ]
         for start in range(0, len(data), _BATCH_SIZE):

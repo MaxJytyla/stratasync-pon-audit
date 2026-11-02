@@ -1,0 +1,31 @@
+[package]
+name = "stratasync-pon-audit"
+version = "2.0.0"
+edition = "2024"
+description = "Pulls VIAVI TruePON results from StrataSync into the RMN2 PON Audit Google Sheet"
+publish = false
+
+[[bin]]
+name = "stratasync-pon-audit"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+csv = "1.4"
+eframe = "0.37"
+egui_extras = "0.37"
+flate2 = "1.1"
+regex = "1.13"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
