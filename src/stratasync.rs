@@ -29,7 +29,6 @@ use crate::timeutil::{self, Time};
 const TOKEN_PATH: &str = "/oauth/token";
 const SEARCH_PATH: &str = "/api/v1/testresults/search";
 pub const SYNC_TIME: &str = "syncTime";
-pub const CREATED_ON: &str = "createdOn";
 
 /// Renew the token this long before it actually expires.
 const TOKEN_MARGIN_S: f64 = 60.0;
@@ -84,9 +83,14 @@ impl StrataSyncClient {
     /// Request a new access token with the client credentials, and use it from now on.
     pub fn request_token(&mut self) -> Result<Value> {
         let (Some(id), Some(secret)) = (self.settings.client_id.clone(), self.settings.client_secret.clone()) else {
-            return Err(AppError::stratasync("A client ID and client secret are required to request a token", None, None));
+            return Err(AppError::stratasync(
+                "A client ID and client secret are required to request a token",
+                None,
+                None,
+            ));
         };
-        let form = [("grant_type", "client_credentials"), ("scope", ""), ("client_id", &id), ("client_secret", &secret)];
+        let form =
+            [("grant_type", "client_credentials"), ("scope", ""), ("client_id", &id), ("client_secret", &secret)];
         let url = self.url(TOKEN_PATH);
         let resp = send(|| self.http.post(&url).form(&form).header("Accept", "application/json"))?;
         let status = resp.status();
@@ -108,7 +112,8 @@ impl StrataSyncClient {
             Some(Value::String(s)) => s.parse().unwrap_or(900.0),
             _ => 900.0,
         };
-        self.token_expires_at = Some(Instant::now() + StdDuration::from_secs_f64((expires_in - TOKEN_MARGIN_S).max(0.0)));
+        self.token_expires_at =
+            Some(Instant::now() + StdDuration::from_secs_f64((expires_in - TOKEN_MARGIN_S).max(0.0)));
         Ok(body)
     }
 
@@ -159,7 +164,11 @@ impl StrataSyncClient {
             } else {
                 ""
             };
-            return Err(AppError::stratasync(format!("HTTP {status} from {SEARCH_PATH}: {message}{hint}"), Some(status), Some(text)));
+            return Err(AppError::stratasync(
+                format!("HTTP {status} from {SEARCH_PATH}: {message}{hint}"),
+                Some(status),
+                Some(text),
+            ));
         };
         if body.get("type").and_then(Value::as_str) != Some("success") {
             let message = match body.get("message") {
@@ -230,9 +239,7 @@ pub fn parse_test_file(content: &[u8]) -> std::result::Result<Value, String> {
         Ok(v) => Ok(v),
         Err(json_err) => {
             let mut text = Vec::new();
-            flate2::read::GzDecoder::new(content)
-                .read_to_end(&mut text)
-                .map_err(|_| json_err.to_string())?;
+            flate2::read::GzDecoder::new(content).read_to_end(&mut text).map_err(|_| json_err.to_string())?;
             serde_json::from_slice(&text).map_err(|e| e.to_string())
         }
     }
@@ -329,11 +336,16 @@ mod tests {
             (200, r#"{"type": "error", "message": "bad range", "httpStatus": 400}"#),
         ]);
         let err = client(base).search(&json!({})).unwrap_err();
-        assert!(matches!(&err, AppError::StrataSync { message, status: Some(400), .. } if message == "Search failed: bad range"), "{err:?}");
+        assert!(
+            matches!(&err, AppError::StrataSync { message, status: Some(400), .. } if message == "Search failed: bad range"),
+            "{err:?}"
+        );
 
         let (base, _) = serve(vec![(200, r#"{"access_token": "T"}"#), (404, "not here")]);
         let err = client(base).download_json(5).unwrap_err();
-        assert!(matches!(err, DownloadError::Fetch(e) if e.text().starts_with("HTTP 404 downloading test 5: not here")));
+        assert!(
+            matches!(err, DownloadError::Fetch(e) if e.text().starts_with("HTTP 404 downloading test 5: not here"))
+        );
 
         let (base, _) = serve(vec![(200, r#"{"access_token": "T"}"#), (200, "<html>")]);
         assert!(matches!(client(base).download_json(5).unwrap_err(), DownloadError::Unreadable(_)));
@@ -364,7 +376,11 @@ mod tests {
         let found = client(base).search_between(start, end, SYNC_TIME).unwrap();
         assert_eq!(found.iter().map(|r| r["_id"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
         let seen = seen.lock().unwrap();
-        assert!(seen[1].contains(r#""startDate":"2026-10-28T00:00:00-04:00","endDate":"2026-10-28T23:59:59-04:00""#), "{}", seen[1]);
+        assert!(
+            seen[1].contains(r#""startDate":"2026-10-28T00:00:00-04:00","endDate":"2026-10-28T23:59:59-04:00""#),
+            "{}",
+            seen[1]
+        );
         assert!(seen[2].contains(r#""startDate":"2026-10-29T00:00:00-04:00","endDate":"2026-10-29T12:00:00-04:00""#));
     }
 }

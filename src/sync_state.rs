@@ -88,7 +88,8 @@ impl SyncState {
         self.last_run_at = Some(run_at);
         self.last_run_results = timed.len();
         let Some(newest) = timed.iter().map(|(t, _)| *t).max() else { return };
-        let mut ids_at_newest: BTreeSet<i64> = timed.iter().filter(|(t, _)| *t == newest).filter_map(|(_, id)| *id).collect();
+        let mut ids_at_newest: BTreeSet<i64> =
+            timed.iter().filter(|(t, _)| *t == newest).filter_map(|(_, id)| *id).collect();
         if self.last_sync_time == Some(newest) {
             ids_at_newest.extend(self.ids_at_last_sync_time.iter().copied());
         }
@@ -112,7 +113,10 @@ mod tests {
         let mut state = SyncState::default();
         let run_at = timeutil::parse_aware("2026-10-29T13:00:00Z").unwrap();
         assert!(!state.is_already_processed(&rec(1, "2026-10-29T12:00:00Z")));
-        state.advance(&[rec(1, "2026-10-29T12:00:00Z"), rec(2, "2026-10-29T12:30:00Z"), rec(3, "2026-10-29T12:30:00Z")], run_at);
+        state.advance(
+            &[rec(1, "2026-10-29T12:00:00Z"), rec(2, "2026-10-29T12:30:00Z"), rec(3, "2026-10-29T12:30:00Z")],
+            run_at,
+        );
         assert_eq!(state.ids_at_last_sync_time, vec![2, 3]);
         assert_eq!(state.last_run_results, 3);
         assert!(state.is_already_processed(&rec(1, "2026-10-29T12:00:00Z")));

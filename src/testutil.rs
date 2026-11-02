@@ -31,7 +31,8 @@ pub fn serve(script: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<String>
             reader.read_exact(&mut body_in).unwrap();
             log.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body_in)));
             let mut s = stream;
-            write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                .unwrap();
         }
     });
     (addr, seen)

@@ -8,7 +8,18 @@ fn s(v: &[&str]) -> Vec<String> {
 /// A rack tab like the real one (note the double space in "OLT and Port  (B)").
 fn rack_values() -> Vec<Vec<String>> {
     vec![
-        s(&["DH", "Row", "Rack", "OLT and Port (A)", "dBm in Port 1", "Timestamp P1", "OLT and Port  (B)", "dBm in Port 2", "Timestamp P2", "Issue"]),
+        s(&[
+            "DH",
+            "Row",
+            "Rack",
+            "OLT and Port (A)",
+            "dBm in Port 1",
+            "Timestamp P1",
+            "OLT and Port  (B)",
+            "dBm in Port 2",
+            "Timestamp P2",
+            "Issue",
+        ]),
         s(&["A", "12", "25", "01 17 AA 01", "", "", "01 17 BB 01", "", "", ""]),
         s(&["A", "12", "26", "01 17 AA 02", "-19.1", "2026-10-20T08:00:00-04:00", "01 17 BB 02", "", "", ""]),
         s(&["A", "12", "27", "", "", "", "", "", "", ""]),
@@ -19,7 +30,20 @@ fn rack_values() -> Vec<Vec<String>> {
 
 fn f1_values() -> Vec<Vec<String>> {
     vec![
-        s(&["DH", "Row", "Channel", "OLT-ID 1", "F1.01", "Timestamp F1.01", "OLT-ID 2", "F1.02", "Timestamp F1.02", "OLT-ID 3", "F1.03", "Timestamp F1.03"]),
+        s(&[
+            "DH",
+            "Row",
+            "Channel",
+            "OLT-ID 1",
+            "F1.01",
+            "Timestamp F1.01",
+            "OLT-ID 2",
+            "F1.02",
+            "Timestamp F1.02",
+            "OLT-ID 3",
+            "F1.03",
+            "Timestamp F1.03",
+        ]),
         s(&["A", "1", "a", "01 21 AA 09", "", "", "01 21 AA 10", "", "", "01 21 AA 11", "", ""]),
     ]
 }
@@ -174,10 +198,10 @@ fn plan_writes_good_results_and_flags_bad_ones() {
         reading("RMN2.DHA.12.25B", "2026-10-29T08:01:00-04:00", Some(-18.0), "01 17 BB 09"), // mismatch
         reading("RMN2.DHA.12.26A", "2026-10-19T08:00:00-04:00", Some(-17.0), "01 17 AA 02"), // older than sheet
         reading("RMN2.DHA.12.27A", "2026-10-29T08:02:00-04:00", Some(-17.0), "01 17 AA 03"), // no expected OLT
-        reading("RMN2.DHA.13.1A", "2026-10-29T08:03:00-04:00", None, "00 00 00 00"),       // no reading, no OLT
-        reading("RMN2.DHA.99.1A", "2026-10-29T08:04:00-04:00", Some(-17.0), "01 17 AA 01"), // no row
-        reading("RMN2.DHB.1.1A", "2026-10-29T08:05:00-04:00", Some(-17.0), "01 17 AA 01"),  // tab missing
-        reading("SOMETHING.ELSE", "2026-10-29T08:06:00-04:00", Some(-17.0), "01 17 AA 01"), // label
+        reading("RMN2.DHA.13.1A", "2026-10-29T08:03:00-04:00", None, "00 00 00 00"),         // no reading, no OLT
+        reading("RMN2.DHA.99.1A", "2026-10-29T08:04:00-04:00", Some(-17.0), "01 17 AA 01"),  // no row
+        reading("RMN2.DHB.1.1A", "2026-10-29T08:05:00-04:00", Some(-17.0), "01 17 AA 01"),   // tab missing
+        reading("SOMETHING.ELSE", "2026-10-29T08:06:00-04:00", Some(-17.0), "01 17 AA 01"),  // label
         reading("RMN2.DHA.01.F1.02A", "2026-10-29T08:07:00-04:00", Some(-15.25), "01 21 AA 10"), // F1 good
         reading("RMN2.DHA.13.1B", "", Some(-15.0), "01 18 BB 01"),                           // no time
     ];
@@ -199,7 +223,16 @@ fn plan_writes_good_results_and_flags_bad_ones() {
     assert_eq!(plan.written_cells().len(), 2);
 
     let kinds: Vec<&str> = plan.flags.iter().map(|f| f.kind.as_str()).collect();
-    for k in ["olt_mismatch", "no_expected_olt", "no_reading", "no_olt_id", "no_row", "missing_tab", "unknown_label", "no_test_time"] {
+    for k in [
+        "olt_mismatch",
+        "no_expected_olt",
+        "no_reading",
+        "no_olt_id",
+        "no_row",
+        "missing_tab",
+        "unknown_label",
+        "no_test_time",
+    ] {
         assert!(kinds.contains(&k), "missing flag {k}: {kinds:?}");
     }
     let mismatch = plan.flags.iter().find(|f| f.kind == "olt_mismatch").unwrap();
@@ -240,9 +273,17 @@ fn latest_test_of_a_location_wins() {
 fn tab_index_rules() {
     let mut bad = rack_values();
     bad.push(s(&["a", "12.0", "25"])); // same key as row 2 once normalized
-    assert!(TabIndex::build("T", bad, &RACK_KEY_HEADERS).unwrap_err().contains("duplicate key ('A', 12, 25) (rows 2 and 7)"));
+    assert!(
+        TabIndex::build("T", bad, &RACK_KEY_HEADERS)
+            .unwrap_err()
+            .contains("duplicate key ('A', 12, 25) (rows 2 and 7)")
+    );
     assert!(TabIndex::build("T", vec![], &RACK_KEY_HEADERS).unwrap_err().contains("is empty"));
-    assert!(TabIndex::build("T", vec![s(&["DH", "Row"])], &RACK_KEY_HEADERS).unwrap_err().contains("missing key columns ['Rack']"));
+    assert!(
+        TabIndex::build("T", vec![s(&["DH", "Row"])], &RACK_KEY_HEADERS)
+            .unwrap_err()
+            .contains("missing key columns ['Rack']")
+    );
     let idx = TabIndex::build("T", rack_values(), &RACK_KEY_HEADERS).unwrap();
     assert_eq!(idx.column("OLT and Port (B)").unwrap(), 7);
     assert_eq!(idx.get(2, 50), "");

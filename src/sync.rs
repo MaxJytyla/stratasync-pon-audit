@@ -29,7 +29,8 @@ use crate::error::{AppError, Result};
 use crate::history::{self, FLAG_FIELDS, Log};
 use crate::pon_audit::{
     CableReplacementPlan, Flag, RACK_KEY_HEADERS, TabIndex, UpdatePlan, audit_tabs, build_indexes, is_multi_service,
-    json_text, plan_cable_replacement, plan_updates, rack_tab, reading_from_search, readings_from_result, record_source,
+    json_text, plan_cable_replacement, plan_updates, rack_tab, reading_from_search, readings_from_result,
+    record_source,
 };
 use crate::sheets::SheetWriter;
 use crate::stratasync::{DownloadError, SYNC_TIME, StrataSyncClient};
@@ -141,11 +142,7 @@ fn run_sync_locked(
         position_saved: None,
     };
 
-    log(&format!(
-        "Searching StrataSync ({}) for results received {} -> now",
-        ss.base_url,
-        timeutil::fmt_local(&start)
-    ));
+    log(&format!("Searching StrataSync ({}) for results received {} -> now", ss.base_url, timeutil::fmt_local(&start)));
     let mut client = StrataSyncClient::new(ss.clone())?;
     let found = client.search_between(start, run_at, SYNC_TIME)?;
     let records: Vec<Value> =
@@ -161,7 +158,8 @@ fn run_sync_locked(
     new.sort_by_key(|r| r.get("syncTime").and_then(Value::as_str).unwrap_or("").to_string());
     for rec in new {
         let source = record_source(rec);
-        let has_power = !matches!(rec.get("power"), None | Some(Value::Null)) && rec.get("power") != Some(&Value::from(""));
+        let has_power =
+            !matches!(rec.get("power"), None | Some(Value::Null)) && rec.get("power") != Some(&Value::from(""));
         if has_power && !is_multi_service(rec) {
             match reading_from_search(rec) {
                 Ok(r) => {
@@ -171,7 +169,8 @@ fn run_sync_locked(
                 Err(e) => log(&format!("Unexpected search values for {source}: {e}")),
             }
         }
-        let why = if is_multi_service(rec) { "tested several PON types" } else { "no usable power reading in search result" };
+        let why =
+            if is_multi_service(rec) { "tested several PON types" } else { "no usable power reading in search result" };
         log(&format!("Downloading {} ({why})", json_text(rec.get("name"))));
         let label = rec
             .get("testLocationsLabel")
@@ -212,11 +211,7 @@ fn run_sync_locked(
     }
     result.plan = plan_updates(readings, &build_indexes(&tabs)?, false)?;
     result.plan.flags.extend(unreadable);
-    log(&format!(
-        "Planned {} result(s) to write, {} flag(s)",
-        result.plan.written.len(),
-        result.plan.flags.len()
-    ));
+    log(&format!("Planned {} result(s) to write, {} flag(s)", result.plan.written.len(), result.plan.flags.len()));
 
     if !apply {
         log("Preview only: nothing was written and the download position was not moved.");
@@ -271,7 +266,8 @@ pub fn replace_cable(
     }
     let n = writer.write_cells(&plan.updates)?;
     let cleared = plan.cleared();
-    let left = if cleared < plan.racks.len() { format!(", left {} alone", plan.racks.len() - cleared) } else { String::new() };
+    let left =
+        if cleared < plan.racks.len() { format!(", left {} alone", plan.racks.len() - cleared) } else { String::new() };
     log(&format!(
         "Cable replaced: {} at {}. Cleared {cleared} rack(s) ({n} cells) in '{tab}'{left}",
         plan.cable(),
@@ -326,7 +322,8 @@ mod tests {
         .unwrap();
         let wrapper = dir.join("bridge.sh");
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fake_bridge.py");
-        fs::write(&wrapper, format!("#!/bin/sh\nFAKE_SHEET='{}' exec python3 '{}'\n", sheet.display(), fake.display())).unwrap();
+        fs::write(&wrapper, format!("#!/bin/sh\nFAKE_SHEET='{}' exec python3 '{}'\n", sheet.display(), fake.display()))
+            .unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: only this test reads these variables.
         unsafe {
@@ -359,9 +356,14 @@ mod tests {
             "results": {"testTime": "2026-10-29T08:10:00-04:00", "data": {"xgspon": {"powerDownstream": -17.25, "oltId": [1, 23, 170, 2]}}},
             "testLocations": [{"label": "RMN2.DHA.12.26A"}]}]}"#;
         let (base, seen) = serve(vec![
-            (200, TOKEN), (200, search), (200, FILE), // preview
-            (200, TOKEN), (200, search), (200, FILE), // apply
-            (200, TOKEN), (200, search),              // re-run: nothing new
+            (200, TOKEN),
+            (200, search),
+            (200, FILE), // preview
+            (200, TOKEN),
+            (200, search),
+            (200, FILE), // apply
+            (200, TOKEN),
+            (200, search), // re-run: nothing new
         ]);
         let ss = StrataSyncSettings {
             base_url: base,
@@ -411,7 +413,10 @@ mod tests {
 
         // The lock is held during a run: a second one is refused.
         let lock = run_lock().unwrap();
-        assert!(matches!(run_sync(&ss, &settings, true, None, &log, history::AUTOMATIC), Err(AppError::RunInProgress(_))));
+        assert!(matches!(
+            run_sync(&ss, &settings, true, None, &log, history::AUTOMATIC),
+            Err(AppError::RunInProgress(_))
+        ));
         drop(lock);
 
         fs::remove_dir_all(&dir).unwrap();

@@ -34,12 +34,6 @@ pub struct Settings {
     pub sheet_id: String,
 }
 
-impl Settings {
-    pub fn service_account_email(&self) -> &str {
-        self.service_account_info.get("client_email").and_then(Value::as_str).unwrap_or("the service account")
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct StrataSyncSettings {
     pub base_url: String,
@@ -112,9 +106,7 @@ pub fn parse_service_account(text: &str) -> Result<Map<String, Value>> {
 }
 
 fn not_a_key() -> AppError {
-    AppError::config(
-        "That JSON is not a Google service account key (it should contain \"type\": \"service_account\").",
-    )
+    AppError::config("That JSON is not a Google service account key (it should contain \"type\": \"service_account\").")
 }
 
 pub fn make_settings(sheet_id: &str, service_account_json: &str) -> Result<Settings> {
@@ -128,9 +120,7 @@ pub fn make_stratasync_settings(region: &str, client_id: &str, client_secret: &s
     let url = region_url(region).ok_or_else(|| AppError::config(format!("Unknown StrataSync region '{region}'.")))?;
     let (client_id, client_secret) = (client_id.trim(), client_secret.trim());
     if client_id.is_empty() || client_secret.is_empty() {
-        return Err(AppError::config(
-            "Enter the StrataSync client ID and client secret (VIAVI TAC provides these).",
-        ));
+        return Err(AppError::config("Enter the StrataSync client ID and client secret (VIAVI TAC provides these)."));
     }
     Ok(StrataSyncSettings {
         base_url: url.to_string(),
@@ -222,7 +212,8 @@ fn owner_only_file(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
-    const KEY: &str = r#"{"type": "service_account", "client_email": "bot@x.iam.gserviceaccount.com", "private_key": "k"}"#;
+    const KEY: &str =
+        r#"{"type": "service_account", "client_email": "bot@x.iam.gserviceaccount.com", "private_key": "k"}"#;
 
     #[test]
     fn sheet_ids() {
@@ -261,8 +252,11 @@ mod tests {
         let path = dir.join("settings.json");
         // A file written by the Python app, with an extra unknown key.
         fs::create_dir_all(&dir).unwrap();
-        fs::write(&path, r#"{"region": "EU", "client_id": "abc", "sheet_id": "S", "auto_update_minutes": 30, "old": 1}"#)
-            .unwrap();
+        fs::write(
+            &path,
+            r#"{"region": "EU", "client_id": "abc", "sheet_id": "S", "auto_update_minutes": 30, "old": 1}"#,
+        )
+        .unwrap();
         let form = SavedForm::load_from(&path);
         assert_eq!((form.region.as_str(), form.client_id.as_str(), form.auto_update_minutes), ("EU", "abc", 30));
         assert!(form.remember_secrets);

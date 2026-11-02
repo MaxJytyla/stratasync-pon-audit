@@ -46,7 +46,9 @@ impl AppError {
                 }
                 text
             }
-            AppError::Config(m) | AppError::RunInProgress(m) | AppError::SheetAccess(m) | AppError::Other(m) => m.clone(),
+            AppError::Config(m) | AppError::RunInProgress(m) | AppError::SheetAccess(m) | AppError::Other(m) => {
+                m.clone()
+            }
         }
     }
 }

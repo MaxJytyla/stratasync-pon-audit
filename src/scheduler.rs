@@ -19,6 +19,7 @@ use crate::history;
 use crate::sync::run_sync;
 
 pub const AUTO_UPDATE_ARG: &str = "--auto-update";
+#[cfg(target_os = "macos")]
 pub const LAUNCHD_LABEL: &str = "com.stratasync.ponaudit.update";
 pub const MIN_MINUTES: u32 = 5;
 pub const MAX_MINUTES: u32 = 7 * 24 * 60;
@@ -51,7 +52,7 @@ pub fn command() -> Vec<String> {
 }
 
 pub fn describe(minutes: u32) -> String {
-    if minutes % 60 != 0 {
+    if !minutes.is_multiple_of(60) {
         return format!("{minutes} minutes");
     }
     match minutes / 60 {
@@ -211,7 +212,8 @@ pub fn xml_unescape(s: &str) -> String {
 
 /// The Task Scheduler definition for an update every `minutes`, starting one interval from now.
 pub fn win_task_xml(minutes: u32, cmd: &[String], user: &str, start: &str) -> String {
-    let args: Vec<String> = cmd[1..].iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect();
+    let args: Vec<String> =
+        cmd[1..].iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -287,7 +289,9 @@ pub fn parse_task_xml(xml: &str) -> Schedule {
 
 /// schtasks writes its XML as UTF-16 or in the console code page.
 pub fn decode_console(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && (bytes.starts_with(&[0xFF, 0xFE]) || bytes.iter().skip(1).step_by(2).take(16).all(|b| *b == 0)) {
+    if bytes.len() >= 2
+        && (bytes.starts_with(&[0xFF, 0xFE]) || bytes.iter().skip(1).step_by(2).take(16).all(|b| *b == 0))
+    {
         let start = if bytes.starts_with(&[0xFF, 0xFE]) { 2 } else { 0 };
         let units: Vec<u16> = bytes[start..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         return String::from_utf16_lossy(&units);
@@ -308,9 +312,8 @@ mod win {
     }
 
     pub fn install(minutes: u32) -> Result<(), AppError> {
-        let start = (chrono::Local::now() + chrono::Duration::minutes(minutes as i64))
-            .format("%Y-%m-%dT%H:%M:00")
-            .to_string();
+        let start =
+            (chrono::Local::now() + chrono::Duration::minutes(minutes as i64)).format("%Y-%m-%dT%H:%M:00").to_string();
         let user = format!(
             "{}\\{}",
             std::env::var("USERDOMAIN").unwrap_or_default(),

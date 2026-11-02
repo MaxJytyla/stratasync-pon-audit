@@ -99,11 +99,7 @@ pub fn py_repr(s: &str) -> String {
 
 /// A float as Python's str() shows it: -18.0 stays "-18.0".
 pub fn py_float(v: f64) -> String {
-    if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e16 {
-        format!("{v:.1}")
-    } else {
-        format!("{v}")
-    }
+    if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e16 { format!("{v:.1}") } else { format!("{v}") }
 }
 
 /// A JSON value as text: strings as-is, null/missing as "None" (like Python's f-strings).
@@ -131,11 +127,9 @@ fn opt_f64(v: Option<&Value>) -> Result<Option<f64>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => Ok(n.as_f64()),
         Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
-        Some(Value::String(s)) => s
-            .trim()
-            .parse::<f64>()
-            .map(Some)
-            .map_err(|_| format!("could not convert string to float: {}", py_repr(s))),
+        Some(Value::String(s)) => {
+            s.trim().parse::<f64>().map(Some).map_err(|_| format!("could not convert string to float: {}", py_repr(s)))
+        }
         Some(other) => Err(format!("not a number: {other}")),
     }
 }
@@ -148,7 +142,7 @@ fn opt_i64(v: Option<&Value>) -> Option<i64> {
     }
 }
 
-fn obj<'a>(v: Option<&'a Value>) -> &'a serde_json::Map<String, Value> {
+fn obj(v: Option<&Value>) -> &serde_json::Map<String, Value> {
     static EMPTY: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
     match v {
         Some(Value::Object(m)) => m,
@@ -419,7 +413,11 @@ impl TestReading {
 ///
 /// The file doesn't record when StrataSync received it; pass the search
 /// result's syncTime so an unreliable test time can be replaced.
-pub fn readings_from_result(doc: &Value, source: Option<&str>, sync_time: Option<&str>) -> Result<Vec<TestReading>, String> {
+pub fn readings_from_result(
+    doc: &Value,
+    source: Option<&str>,
+    sync_time: Option<&str>,
+) -> Result<Vec<TestReading>, String> {
     let asset = obj(doc.get("assetInfo"));
     let workflow = obj(doc.get("workflow"));
     let tech = obj(workflow.get("techInfo"));
@@ -440,10 +438,10 @@ pub fn readings_from_result(doc: &Value, source: Option<&str>, sync_time: Option
         let config = obj(test.get("configuration"));
         let signal = pick_service(config.get("signalSetup").and_then(Value::as_str), &source_text)?;
         let signal_config = signal.as_deref().map(|s| obj(config.get(s))).unwrap_or_else(|| obj(None));
-        if let Some(fmt) = signal_config.get("oltIdFormat") {
-            if fmt.as_str() != Some("hex") {
-                return Err(format!("Unexpected oltIdFormat {} in {source_text}", json_repr(fmt)));
-            }
+        if let Some(fmt) = signal_config.get("oltIdFormat")
+            && fmt.as_str() != Some("hex")
+        {
+            return Err(format!("Unexpected oltIdFormat {} in {source_text}", json_repr(fmt)));
         }
         let results = obj(test.get("results"));
         let data = signal.as_deref().map(|s| obj(obj(results.get("data")).get(s))).unwrap_or_else(|| obj(None));
@@ -584,7 +582,8 @@ impl TabIndex {
                 columns.entry(name).or_insert(i + 1);
             }
         }
-        let missing: Vec<String> = key_headers.iter().filter(|h| !columns.contains_key(**h)).map(|h| py_repr(h)).collect();
+        let missing: Vec<String> =
+            key_headers.iter().filter(|h| !columns.contains_key(**h)).map(|h| py_repr(h)).collect();
         if !missing.is_empty() {
             return Err(format!("Tab {} is missing key columns [{}]", py_repr(title), missing.join(", ")));
         }
@@ -739,11 +738,7 @@ pub struct UpdatePlan {
 impl UpdatePlan {
     /// Each written reading with its (power, timestamp) cell updates.
     pub fn written_cells(&self) -> Vec<(&TestReading, &CellUpdate, &CellUpdate)> {
-        self.written
-            .iter()
-            .zip(self.updates.chunks_exact(2))
-            .map(|(r, pair)| (r, &pair[0], &pair[1]))
-            .collect()
+        self.written.iter().zip(self.updates.chunks_exact(2)).map(|(r, pair)| (r, &pair[0], &pair[1])).collect()
     }
 
     /// Skipped readings other than flagged ones (those are listed with the flags).
@@ -840,16 +835,17 @@ pub fn plan_updates(
         let time_col = index.column(cols.timestamp)?;
         let power_col = index.column(cols.power)?;
         let existing = index.get(row, time_col);
-        if let Some(existing_time) = timeutil::parse_lenient(existing) {
-            if existing_time >= stamp && !overwrite_newer {
-                let why = if is_blank(index.get(row, power_col)) {
-                    format!("tested before cable replacement ({existing})")
-                } else {
-                    "sheet already has this or a newer result".to_string()
-                };
-                plan.skipped.push((reading, why));
-                continue;
-            }
+        if let Some(existing_time) = timeutil::parse_lenient(existing)
+            && existing_time >= stamp
+            && !overwrite_newer
+        {
+            let why = if is_blank(index.get(row, power_col)) {
+                format!("tested before cable replacement ({existing})")
+            } else {
+                "sheet already has this or a newer result".to_string()
+            };
+            plan.skipped.push((reading, why));
+            continue;
         }
 
         let problems = reading_problems(&reading, index.get(row, index.column(cols.expected_olt)?));
@@ -897,7 +893,6 @@ pub struct RackClearing {
 
 #[derive(Debug, Clone)]
 pub struct CableReplacementPlan {
-    pub tab: String,
     pub data_hall: String,
     pub row: i64,
     pub channel: String,
@@ -934,7 +929,6 @@ pub fn plan_cable_replacement(
     let (power_col, time_col) = (index.column(cols.power)?, index.column(cols.timestamp)?);
     let stamp = timeutil::iso(&replaced_at);
     let mut plan = CableReplacementPlan {
-        tab: index.title.clone(),
         data_hall: data_hall.into(),
         row,
         channel: channel.into(),
@@ -956,27 +950,44 @@ pub fn plan_cable_replacement(
     for (rack, r) in racks {
         let old_power = index.get(r, power_col).to_string();
         let old_time = index.get(r, time_col).to_string();
-        if let Some(existing) = timeutil::parse_lenient(&old_time) {
-            if existing > replaced_at {
-                let reason = if is_blank(&old_power) {
-                    "a later replacement is already recorded"
-                } else {
-                    "already tested after the replacement"
-                };
-                plan.racks.push(RackClearing {
-                    rack,
-                    row: r,
-                    old_power,
-                    old_timestamp: old_time,
-                    cleared: false,
-                    reason: reason.into(),
-                });
-                continue;
-            }
+        if let Some(existing) = timeutil::parse_lenient(&old_time)
+            && existing > replaced_at
+        {
+            let reason = if is_blank(&old_power) {
+                "a later replacement is already recorded"
+            } else {
+                "already tested after the replacement"
+            };
+            plan.racks.push(RackClearing {
+                rack,
+                row: r,
+                old_power,
+                old_timestamp: old_time,
+                cleared: false,
+                reason: reason.into(),
+            });
+            continue;
         }
-        plan.racks.push(RackClearing { rack, row: r, old_power, old_timestamp: old_time, cleared: true, reason: String::new() });
-        plan.updates.push(CellUpdate { tab: index.title.clone(), row: r, col: power_col, value: CellValue::Text(String::new()) });
-        plan.updates.push(CellUpdate { tab: index.title.clone(), row: r, col: time_col, value: CellValue::Text(stamp.clone()) });
+        plan.racks.push(RackClearing {
+            rack,
+            row: r,
+            old_power,
+            old_timestamp: old_time,
+            cleared: true,
+            reason: String::new(),
+        });
+        plan.updates.push(CellUpdate {
+            tab: index.title.clone(),
+            row: r,
+            col: power_col,
+            value: CellValue::Text(String::new()),
+        });
+        plan.updates.push(CellUpdate {
+            tab: index.title.clone(),
+            row: r,
+            col: time_col,
+            value: CellValue::Text(stamp.clone()),
+        });
     }
     Ok(plan)
 }

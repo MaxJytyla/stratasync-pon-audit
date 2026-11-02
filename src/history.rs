@@ -30,12 +30,36 @@ pub const MANUAL: &str = "manual";
 pub const AUTOMATIC: &str = "automatic";
 
 pub const RUNS_HEADER: [&str; 16] = [
-    "run_at", "trigger", "status", "sheet", "searched_from", "searched_to", "found", "truepon", "new", "written",
-    "flagged", "skipped", "cells_written", "download_failures", "position_saved", "message",
+    "run_at",
+    "trigger",
+    "status",
+    "sheet",
+    "searched_from",
+    "searched_to",
+    "found",
+    "truepon",
+    "new",
+    "written",
+    "flagged",
+    "skipped",
+    "cells_written",
+    "download_failures",
+    "position_saved",
+    "message",
 ];
 pub const FLAG_FIELDS: [&str; 7] = ["kind", "label", "message", "test_time", "tech", "serial_no", "source"];
 const WRITTEN_HEADER: [&str; 12] = [
-    "run_at", "trigger", "sheet", "label", "tab", "cells", "dbm", "test_time", "sheet_time", "tech", "serial_no",
+    "run_at",
+    "trigger",
+    "sheet",
+    "label",
+    "tab",
+    "cells",
+    "dbm",
+    "test_time",
+    "sheet_time",
+    "tech",
+    "serial_no",
     "source",
 ];
 
@@ -70,11 +94,7 @@ pub fn flag_row(f: &Flag) -> Vec<String> {
 /// Write rows as CSV (with the UTF-8 BOM Excel wants at the start of a new file).
 pub fn write_csv(path: &Path, header: &[&str], rows: &[Vec<String>], append: bool) -> io::Result<()> {
     let new = !append || fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
-    let mut fh = if append {
-        OpenOptions::new().create(true).append(true).open(path)?
-    } else {
-        File::create(path)?
-    };
+    let mut fh = if append { OpenOptions::new().create(true).append(true).open(path)? } else { File::create(path)? };
     let mut buf = Vec::new();
     {
         let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_writer(&mut buf);

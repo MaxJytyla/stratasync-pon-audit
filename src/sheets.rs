@@ -127,8 +127,7 @@ impl SheetWriter {
         if updates.is_empty() {
             return Ok(0);
         }
-        let cells: Vec<Value> =
-            updates.iter().map(|u| json!({"tab": u.tab, "a1": u.a1(), "value": u.value})).collect();
+        let cells: Vec<Value> = updates.iter().map(|u| json!({"tab": u.tab, "a1": u.a1(), "value": u.value})).collect();
         let response = self.request(json!({"op": "write_cells", "updates": cells, "value_input_option": "RAW"}))?;
         Ok(response.get("written").and_then(Value::as_u64).unwrap_or(0) as usize)
     }
@@ -144,8 +143,9 @@ impl SheetWriter {
             Ok(n) if n > 0 => {}
             _ => return Err(self.died()),
         }
-        let response: Value = serde_json::from_str(&reply)
-            .map_err(|e| AppError::other(format!("The Google Sheets helper sent an unreadable reply ({e}): {reply}")))?;
+        let response: Value = serde_json::from_str(&reply).map_err(|e| {
+            AppError::other(format!("The Google Sheets helper sent an unreadable reply ({e}): {reply}"))
+        })?;
         if response.get("ok").and_then(Value::as_bool) == Some(true) {
             return Ok(response);
         }
@@ -209,7 +209,8 @@ pub fn bridge_command() -> Result<Command> {
     }
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if source.join("sheets_bridge").join("__main__.py").is_file() {
-        let python = std::env::var_os("PYTHON").unwrap_or_else(|| (if cfg!(windows) { "python" } else { "python3" }).into());
+        let python =
+            std::env::var_os("PYTHON").unwrap_or_else(|| (if cfg!(windows) { "python" } else { "python3" }).into());
         let mut command = Command::new(python);
         command.arg("-m").arg("sheets_bridge").current_dir(source);
         return Ok(command);
@@ -274,7 +275,8 @@ mod tests {
     use crate::config::make_settings;
     use crate::pon_audit::CellValue;
 
-    const KEY: &str = r#"{"type": "service_account", "client_email": "bot@x.iam.gserviceaccount.com", "private_key": "k"}"#;
+    const KEY: &str =
+        r#"{"type": "service_account", "client_email": "bot@x.iam.gserviceaccount.com", "private_key": "k"}"#;
 
     /// The real bridge protocol code, with gspread replaced by a fake (tests/fake_bridge.py).
     fn fake_bridge() -> Option<Command> {
@@ -306,7 +308,22 @@ mod tests {
         assert_eq!(n, 2);
         // The fake echoes what it was sent as the next read.
         let echoed = w.read_tabs(&["written".into()]).unwrap();
-        assert_eq!(echoed["written"], vec![vec!["'RMN2.DHA PON Audit'!E2", "-18.5"], vec!["'RMN2.DHA PON Audit'!F2", "t"]]);
+        assert_eq!(
+            echoed["written"],
+            vec![vec!["'RMN2.DHA PON Audit'!E2", "-18.5"], vec!["'RMN2.DHA PON Audit'!F2", "t"]]
+        );
+    }
+
+    /// With SHEETS_BRIDGE_EMBED set at build time, the embedded bridge unpacks and answers.
+    #[cfg(embedded_bridge)]
+    #[test]
+    fn embedded_bridge_unpacks_and_runs() {
+        let path = embedded::unpack().unwrap().unwrap();
+        assert_eq!(embedded::unpack().unwrap().unwrap(), path, "unpacked once");
+        let mut child = Command::new(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"op\": \"hello\"}\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#"{"ok": true, "protocol": 1}"#);
     }
 
     #[test]

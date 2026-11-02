@@ -2,6 +2,8 @@
 
 A desktop app for Windows and macOS. It pulls new VIAVI TruePON test results from StrataSync and writes them into the RMN2 PON Audit Google Sheet, then shows a report of what was written and what was flagged.
 
+The app is written in Rust (window: [egui](https://github.com/emilk/egui)). Google Sheets access is still the original Python code: a small helper program, the *sheets bridge*, that the app runs in the background (see [How it fits together](#how-it-fits-together)). It works the same as the earlier all-Python version and keeps its settings, download position and history, so you can switch without setting anything up again.
+
 ## Download
 
 Get the latest build from this repo's **Releases** page (or from the artifacts of the latest **Build** workflow run):
@@ -76,6 +78,7 @@ A result's time is the meter's **test time**, which is when the light was measur
 - `settings.json` holds the form values. The client secret and Google key are saved there only while **Remember client secret and Google key on this computer** is ticked. The file is readable only by your user account.
 - `state/` holds the download position. There is one position for each combination of server, client ID and sheet.
 - `history/` holds the update history (see above).
+- `bin/` (Windows only) holds the unpacked sheets bridge, `sheets-bridge-<version>.exe`. The app recreates it if it's deleted.
 
 VIAVI typically allows only one valid token per client ID, so avoid running updates on two computers with the same client ID at the same time.
 
@@ -89,7 +92,7 @@ The sheet must be a native Google Sheet. An `.xlsx` file uploaded to Drive won't
 
 ## What gets written
 
-`viavi_results/pon_audit.py` maps each TruePON result to the sheet. It only writes to five tabs:
+`src/pon_audit.rs` maps each TruePON result to the sheet. It only writes to five tabs:
 
 | Test label | Tab | Row lookup | Columns written |
 |---|---|---|---|
@@ -103,34 +106,65 @@ The sheet must be a native Google Sheet. An `.xlsx` file uploaded to Drive won't
 - If a location was tested more than once, the latest test wins.
 - If some full-file downloads fail, the results that did download are still written, but the download position doesn't move, so the next update retries.
 
+## How it fits together
+
+```
+StrataSync API  <--HTTPS--  app (Rust)  --stdin/stdout JSON-->  sheets bridge (Python, gspread)  --HTTPS-->  Google Sheets
+```
+
+- The app does everything except talk to Google: the window, StrataSync, deciding what to write, history and scheduling.
+- To read or write the sheet, it starts the sheets bridge as a hidden child process and sends it one JSON request per line: `open` (with the key and sheet ID), `read_tabs` and `write_cells`. The bridge answers each with one JSON line. The protocol is described at the top of `sheets_bridge/__main__.py`. The Google key goes over stdin, never on a command line.
+- The bridge is `sheets_bridge/sheets.py`, the same gspread code the Python app used, plus the small request loop around it.
+- Packaging: on Windows the bridge is embedded in the `.exe` and unpacked to the app's `bin` folder the first time it's needed, so there is still one file to download. On macOS it sits inside the app bundle, next to the app (`Contents/MacOS/sheets-bridge`).
+
 ## Development
 
-Requires Python 3.10+ with Tk. On macOS with Homebrew Python, run `brew install python-tk@3.13`. The python.org installers include Tk.
+You need [Rust](https://rustup.rs) (stable) and Python 3.10+.
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -r requirements-build.txt     # Windows: .venv\Scripts\pip ...
-.venv/bin/python app.py                             # run from source
-.venv/bin/python build.py                           # build the app into dist/
+python -m pip install -r sheets_bridge/requirements.txt
+cargo run                     # run from source; uses `python -m sheets_bridge` from this folder
+cargo test                    # app tests (uses python for the bridge protocol tests)
+python -m unittest discover -s sheets_bridge/tests -t .    # bridge tests
 ```
 
-PyInstaller can't cross-compile, so `build.py` builds for the platform it runs on. The **Build** workflow (`.github/workflows/build.yml`) builds both platforms on every push. Pushing a tag such as `v1.0.0` publishes a release with both files:
+To build a release locally:
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+python -m pip install -r sheets_bridge/requirements-build.txt
+python sheets_bridge/build.py                                  # -> dist/sheets-bridge(.exe)
+
+# Windows (Git Bash): embed the bridge in the exe
+SHEETS_BRIDGE_EMBED="$PWD/dist/sheets-bridge.exe" cargo build --release
+# macOS: build, then assemble and zip the .app
+cargo build --release && packaging/macos/make_app.sh
 ```
 
+PyInstaller can't cross-compile, so each platform is built on that platform. The **Build** workflow (`.github/workflows/build.yml`) runs the tests and builds both platforms on every push. Pushing a tag such as `v2.0.0` publishes a release with both files:
+
+```bash
+git tag v2.0.0 && git push origin v2.0.0
 ```
-app.py                entry point (--auto-update: one update with the saved settings, no window)
-build.py              PyInstaller build
-viavi_results/
-  gui.py              the window: settings form, run, report, CSV export
-  sync.py             one sync run: search -> plan -> write, flags CSV, run lock
-  scheduler.py        automatic updates: launchd / Task Scheduler, the headless run
-  history.py          update history: runs.csv, flagged.csv, written.csv
-  config.py           server URLs, settings validation, saved form, app data folder
-  stratasync.py       StrataSyncClient: login, search, file download
-  pon_audit.py        test result -> PON Audit cells, OLT ID decoding, checks
-  sheets.py           SheetWriter: batch read/write across the sheet's tabs
-  sync_state.py       remembers the last download position
+
+The app looks for the bridge in this order: the `PON_AUDIT_SHEETS_BRIDGE` environment variable (a path to it), next to the app, inside the Windows exe, then `python -m sheets_bridge` in the source folder. `PON_AUDIT_DATA_DIR` moves the data folder, which is useful for testing.
+
+```
+src/
+  main.rs             entry point (--auto-update: one update with the saved settings, no window)
+  gui.rs              the window: settings form, run, report, cable replacement, CSV export
+  sync.rs             one sync run: search -> plan -> write, flags CSV, run lock
+  scheduler.rs        automatic updates: launchd / Task Scheduler, the headless run
+  history.rs          update history: runs.csv, flagged.csv, written.csv
+  config.rs           server URLs, settings validation, saved form, app data folder
+  stratasync.rs       StrataSync client: login, search, file download
+  pon_audit.rs        test result -> PON Audit cells, OLT ID decoding, checks (tests in pon_audit/tests.rs)
+  sheets.rs           runs the sheets bridge and talks to it
+  sync_state.rs       remembers the last download position
+  timeutil.rs         ISO 8601 timestamps
+sheets_bridge/
+  sheets.py           SheetWriter: batch read/write across the sheet's tabs (gspread)
+  __main__.py         the bridge: JSON requests on stdin, responses on stdout
+  build.py            PyInstaller build of the bridge
+packaging/macos/      Info.plist and the script that assembles the .app
+tests/fake_bridge.py  the bridge protocol with an in-memory sheet, for the app's tests
 ```

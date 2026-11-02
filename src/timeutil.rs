@@ -1,9 +1,7 @@
 //! ISO 8601 timestamps, parsed the way Python's `datetime.fromisoformat` does
 //! for the forms StrataSync, the meters and the sheet use.
 
-use chrono::{
-    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc,
-};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc};
 
 /// A moment with a UTC offset. Comparisons are by instant.
 pub type Time = DateTime<FixedOffset>;
