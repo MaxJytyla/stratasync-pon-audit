@@ -407,12 +407,16 @@ class StrataSyncClient:
         template_name: str,
         scheduled: datetime,
         location_labels: Sequence[str],
+        org_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Create a job from a StrataSync job template, assigned to no technician.
 
-        With no techId the job goes to the account's root organization in the
-        STARTED state, and isn't sent to any meter until someone assigns it.
-        Returns the created job (its 'workflow' holds the new workflowId).
+        The job is created in the STARTED state, in organization `org_id`
+        (without it, StrataSync puts it in the account's root organization),
+        and isn't sent to any meter until someone assigns it. The guide only
+        documents 'dispatch' for full job definitions, but this request accepts
+        it too (checked 2026-11-03). Returns the created job (its 'workflow'
+        holds the new workflowId, and 'orgId' its organization).
 
         Sent once and never retried automatically: if the response is lost, a
         retry could create a second job. StrataSync itself refuses a second job
@@ -423,6 +427,7 @@ class StrataSyncClient:
                 "id": work_order_id,
                 "templateName": template_name,
                 "scheduledDate": _fmt_date(scheduled),
+                **({"dispatch": {"orgId": int(org_id)}} if org_id else {}),
             },
             "testLocations": [{"label": label, "required": True} for label in location_labels],
         }

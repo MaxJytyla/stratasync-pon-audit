@@ -730,9 +730,10 @@ class App(ttk.Frame):
         plan = r.reissue
         if plan:
             for job in plan.jobs:
-                status = {"created": f"created ({job.workflow_id})", "failed": f"failed: {job.error}",
+                org = f", organization {job.org_id}" if job.org_id else ""
+                status = {"created": f"created ({job.workflow_id}{org})", "failed": f"failed: {job.error}",
                           "already re-issued": "not created: already re-issued (see below)",
-                          "planned": "would create" if not r.applied else "not created"}[job.status]
+                          "planned": (f"would create{org}" if not r.applied else "not created")}[job.status]
                 self.jobs_tree.insert("", "end", values=(
                     job.work_order_id, status, " ".join(job.labels), " | ".join(t.reason for t in job.retests)))
             for retest, existing in plan.already_reissued:

@@ -33,7 +33,10 @@ A replaced cable gets new jobs for its rack cohorts, named the same way.
 
 New jobs are made from the job template (RMN-BB-PON-Test by default), assigned
 to no technician: they wait in StrataSync, in the STARTED state, until someone
-assigns them.
+assigns them. Each goes into the same StrataSync organization as the job it
+re-issues (e.g. "BlackBox RMN"); without one, StrataSync would put it in the
+account's top organization, where the team doesn't look for jobs. A cable
+replacement's jobs go into the organization of that cable's earlier jobs.
 
 A location is not re-issued when another job holding it is scheduled on or
 after the finished job's date (or, for a test outside any job, the test's day):
@@ -89,6 +92,9 @@ JOBS_SINCE = datetime(2026, 8, 1, tzinfo=timezone.utc)
 JOB_LOOKBACK = timedelta(days=14)
 FINISHED_STATES = frozenset({"COMPLETED", "APPROVED"})
 
+# jobManagement.createdBy of jobs made through the Jobs API.
+API_CREATORS = frozenset({"ssWoApi", "ssWfApi"})
+
 # workOrderId rules from the Jobs API guide.
 _WORK_ORDER_ID = re.compile(r"^[A-Za-z0-9À-ÿ_-][A-Za-z0-9À-ÿ_ .-]{0,49}$")
 
@@ -125,6 +131,7 @@ class PlannedJob:
     cohort: str  # e.g. "RMN2.DHA row 12 channel A, C2"
     base: str  # the cohort's own job name, which work_order_id adds " RT<n>" to
     retests: List[Retest] = field(default_factory=list)
+    org_id: Optional[int] = None  # the StrataSync organization to create it in
     workflow_id: Optional[int] = None  # set once created
     error: str = ""  # set if creating it failed
     skipped: str = ""  # set if every location was re-issued by someone else first
@@ -199,6 +206,8 @@ class ExistingJob:
     location_ids: Tuple[Tuple[Location, Optional[int]], ...] = ()  # each location's workflowId
     tested: int = 0
     total: int = 0
+    org_id: Optional[int] = None
+    created_by: str = ""  # jobManagement.createdBy: "ssJobMgr" (web Job Manager), "ssWoApi" (this app), ...
 
     @property
     def finished(self) -> bool:
@@ -225,7 +234,8 @@ def existing_jobs(jobs: Iterable[Mapping[str, Any]]) -> List[ExistingJob]:
             str(wf.get("workOrderId") or ""), scheduled_at.date() if scheduled_at else None,
             tuple(loc for loc, _ in located), str(job.get("state") or ""), scheduled_at,
             _parse_dt(job.get("jobModifiedOn")), tuple(located),
-            int(stats.get("tested") or 0), int(stats.get("totalCnt") or 0)))
+            int(stats.get("tested") or 0), int(stats.get("totalCnt") or 0), job.get("orgId"),
+            str((wf.get("jobManagement") or {}).get("createdBy") or "")))
     return out
 
 
@@ -443,7 +453,32 @@ def _add_jobs(plan: ReissuePlan, groups: Mapping[str, Tuple[str, List[Retest]]],
     plan.taken = {j.work_order_id.upper() for j in jobs}
     for base, (cohort, members) in sorted(groups.items()):
         members.sort(key=lambda r: r.label)
-        plan.jobs.append(PlannedJob(next_work_order_id(base, plan.taken), cohort, base, members))
+        plan.jobs.append(PlannedJob(next_work_order_id(base, plan.taken), cohort, base, members,
+                                    org_id=_organization(members, jobs)))
+
+
+def _organization(members: Sequence[Retest], jobs: Sequence[ExistingJob]) -> Optional[int]:
+    """The organization for a new job: that of the jobs its locations come from;
+    else that of the newest job holding one of its locations (a cable
+    replacement, or a test outside any job); else the one most of the site's
+    jobs are in. None only if no job says (StrataSync then uses the root).
+
+    Only jobs people made count: jobs made through the API (by this app before
+    it set an organization) may be in the wrong one.
+    """
+    jobs = [j for j in jobs if j.created_by not in API_CREATORS]
+    by_name = {j.work_order_id.strip().upper(): j for j in jobs}
+    own = [by_name[r.own_job.strip().upper()].org_id for r in members
+           if r.own_job and r.own_job.strip().upper() in by_name]
+    own = [o for o in own if o]
+    if own:
+        return max(set(own), key=own.count)
+    locations = {parse_location(r.label) for r in members}
+    holding = [j for j in jobs if j.org_id and j.scheduled and locations & set(j.locations)]
+    if holding:
+        return max(holding, key=lambda j: j.scheduled).org_id
+    site = [j.org_id for j in jobs if j.org_id and j.work_order_id.upper().startswith(SITE)]
+    return max(set(site), key=site.count) if site else None
 
 
 def _covering_job(loc: Location, retest: Retest, jobs: Sequence[ExistingJob]) -> str:
@@ -524,7 +559,8 @@ def create_jobs(client, plan: ReissuePlan, template: str, log: Log) -> None:
             if job.work_order_id.upper() in plan.taken:
                 job.work_order_id = next_work_order_id(job.base, plan.taken)
             try:
-                created = client.create_job_from_template(job.work_order_id, template, scheduled, job.labels)
+                created = client.create_job_from_template(job.work_order_id, template, scheduled, job.labels,
+                                                          org_id=job.org_id)
             except Exception as exc:  # recorded on the job and reported
                 if attempt < 3 and "exists" in str(exc).lower():
                     log(f"Job {job.work_order_id} was created by someone else just now; checking again")
@@ -535,7 +571,12 @@ def create_jobs(client, plan: ReissuePlan, template: str, log: Log) -> None:
                 break
             plan.taken.add(job.work_order_id.upper())
             job.workflow_id = (created.get("workflow") or {}).get("workflowId") or 0
-            log(f"Created job {job.work_order_id} ({len(job.labels)} location(s), workflowId {job.workflow_id})")
+            landed = created.get("orgId")
+            log(f"Created job {job.work_order_id} ({len(job.labels)} location(s), workflowId {job.workflow_id}, "
+                f"organization {landed})")
+            if job.org_id and landed and int(landed) != int(job.org_id):
+                log(f"Warning: {job.work_order_id} was meant for organization {job.org_id} but StrataSync put it "
+                    f"in {landed}; move it in StrataSync")
             break
 
 
