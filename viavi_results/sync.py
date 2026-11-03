@@ -12,6 +12,10 @@ signal status for the flag message.
 Nothing is written, and the saved position doesn't move, unless `apply` is set.
 Every applied run is recorded in the update history (see history.py).
 
+If re-issuing is turned on, locations that need a retest get new, unassigned
+StrataSync jobs after the sheet is written (see reissue.py). A preview shows
+the jobs it would create without creating them.
+
 Only one run at a time, per computer: a run holds `run_lock()`, so an automatic
 update and one started from the window can't overlap (VIAVI allows only one
 valid token per client ID, and both would move the same download position).
@@ -31,6 +35,18 @@ from typing import Callable, Iterator, List, Optional, Tuple
 
 from . import history
 from .config import ConfigError, Settings, StrataSyncSettings, app_data_dir
+from .reissue import (
+    JOB_LOOKBACK,
+    JOBS_SINCE,
+    ReissuePlan,
+    ReissueSettings,
+    apply_updates,
+    create_jobs,
+    existing_jobs,
+    find_retests,
+    plan_cable_jobs,
+    plan_reissue,
+)
 from .pon_audit import (
     AUDIT_TABS,
     RACK_KEY_HEADERS,
@@ -44,6 +60,7 @@ from .pon_audit import (
     plan_updates,
     rack_tab,
     reading_from_search,
+    reading_problems,
     readings_from_result,
 )
 from .sheets import SheetAccessError, SheetWriter
@@ -116,6 +133,14 @@ class SyncResult:
     download_failures: List[str] = field(default_factory=list)
     cells_written: int = 0
     position_saved: Optional[datetime] = None
+    reissue: Optional[ReissuePlan] = None  # None when re-issuing is off
+    reissue_error: str = ""  # why re-issuing couldn't be planned
+
+    @property
+    def reissue_problems(self) -> List[str]:
+        """Re-issue failures; while there are any, the download position isn't moved."""
+        failed = [f"{j.work_order_id}: {j.error}" for j in (self.reissue.failures if self.reissue else [])]
+        return ([f"re-issue: {self.reissue_error}"] if self.reissue_error else []) + failed
 
     def skipped_summary(self) -> List[tuple]:
         """(reason, count) for every reading that wasn't written, most common first."""
@@ -141,17 +166,20 @@ def run_sync(
     since: Optional[datetime] = None,
     log: Log = print,
     trigger: str = history.MANUAL,
+    reissue: Optional[ReissueSettings] = None,
 ) -> SyncResult:
     """Search StrataSync, plan the sheet updates and (if `apply`) write them.
 
-    Applied runs, and their failures, are recorded in the history under `trigger`.
+    With `reissue` enabled, also plans (and if `apply`, creates) jobs for
+    locations that need a retest. Applied runs, and their failures, are
+    recorded in the history under `trigger`.
     Raises RunInProgress, ConfigError, StrataSyncError or SheetAccessError on failure.
     """
     with run_lock():
         if not apply:
-            return _run_sync(ss, settings, apply=False, since=since, log=log)
+            return _run_sync(ss, settings, apply=False, since=since, log=log, reissue=reissue)
         try:
-            result = _run_sync(ss, settings, apply=True, since=since, log=log)
+            result = _run_sync(ss, settings, apply=True, since=since, log=log, reissue=reissue)
         except Exception as exc:
             history.record_status(trigger, "failed", settings.sheet_id, error_text(exc), log)
             raise
@@ -166,6 +194,7 @@ def _run_sync(
     apply: bool,
     since: Optional[datetime],
     log: Log,
+    reissue: Optional[ReissueSettings] = None,
 ) -> SyncResult:
     path = state_file(ss, settings)
     state = SyncState.load(path)
@@ -223,19 +252,28 @@ def _run_sync(
     result.missing_tabs = [t for t in AUDIT_TABS if t not in tabs]
     if result.missing_tabs:
         log(f"Warning: tabs not found: {', '.join(result.missing_tabs)}")
-    result.plan = plan_updates(readings, build_indexes(tabs))
+    indexes = build_indexes(tabs)
+    result.plan = plan_updates(readings, indexes)
     result.plan.flags.extend(unreadable)
     log(f"Planned {len(result.plan.written)} result(s) to write, {len(result.plan.flags)} flag(s)")
+    if reissue and reissue.enabled:
+        result.reissue = _plan_reissue(client, result, indexes, reissue, log)
 
     if not apply:
-        log("Preview only: nothing was written and the download position was not moved.")
+        log("Preview only: nothing was written, no jobs were created and the download position was not moved.")
         return result
 
     result.cells_written = writer.write_cells(result.plan.updates)
     log(f"Wrote {result.cells_written} cell(s) to '{result.sheet_title}'")
+    if result.reissue and result.reissue.jobs:
+        create_jobs(client, result.reissue, reissue.template, log)
     if result.download_failures:
         log("Some downloads failed, so the download position was NOT moved; "
             "the next run will retry them.")
+        return result
+    if result.reissue_problems:
+        log("Some jobs could not be re-issued, so the download position was NOT moved; "
+            "the next run will try them again (jobs already created aren't repeated).")
         return result
     state.advance(records, run_at)
     state.save(path)
@@ -243,6 +281,84 @@ def _run_sync(
     if state.last_sync_time:
         log(f"Saved download position: {state.last_sync_time.astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
     return result
+
+
+def _plan_reissue(client: StrataSyncClient, result: SyncResult, indexes, reissue: ReissueSettings,
+                  log: Log) -> ReissuePlan:
+    """The jobs to re-issue for this run (see reissue.py). A failure here doesn't
+    stop the sheet update; it's recorded in result.reissue_error instead."""
+    if result.download_failures:
+        result.reissue_error = "some results couldn't be downloaded; the next update checks the jobs again"
+        log(f"Re-issue: skipped, because {result.reissue_error}")
+        return ReissuePlan()
+    retests = find_retests(result.plan, reissue)
+    apply_updates(indexes, result.plan.updates)  # judge finished jobs by the sheet after this update
+    log(f"Re-issue: checking jobs finished in the last {JOB_LOOKBACK.days} days"
+        + (f" and the jobs of {len(retests)} result(s) needing a retest" if retests else ""))
+    try:
+        jobs = existing_jobs(client.search_jobs(JOBS_SINCE, datetime.now(timezone.utc) + timedelta(days=35)))
+        plan = plan_reissue(retests, jobs, indexes, reissue, now=datetime.now(timezone.utc), until=result.end,
+                            confirm=lambda found: _confirm(client, found, indexes, reissue, log))
+    except (StrataSyncError, ValueError) as exc:
+        result.reissue_error = error_text(exc)
+        log(f"Re-issue: could not plan jobs: {result.reissue_error}")
+        return ReissuePlan()
+    for retest, existing in plan.already_reissued:
+        log(f"Re-issue: {retest.label} is already in job {existing}; not re-issuing it")
+    for retest, job in plan.waiting:
+        log(f"Re-issue: {retest.label} needs a retest, but its job {job} isn't finished; "
+            "waiting for it to be completed")
+    for retest, why in plan.not_reissued:
+        log(f"Re-issue: {retest.label} not re-issued: {why}")
+    if plan.sheet_behind:
+        log(f"Re-issue: {len(plan.sheet_behind)} location(s) passed in their job but the sheet doesn't have "
+            "that result yet (synced before this computer's download position). Run an update with an "
+            "earlier 'Search from' date to catch the sheet up; they aren't re-issued.")
+    log(f"Re-issue: {len(plan.jobs)} job(s) for {sum(len(j.retests) for j in plan.jobs)} location(s); "
+        f"{len(plan.already_reissued)} already re-issued, {len(plan.waiting)} waiting for their job, "
+        f"{len(plan.not_reissued)} not re-issued")
+    return plan
+
+
+def _confirm(client: StrataSyncClient, retests: List, indexes, reissue: ReissueSettings,
+             log: Log) -> dict:
+    """reissue.Confirm: look up each location's tests in its job, several at once.
+
+    A location passes if a test in the job has no problem (OLT ID as the sheet
+    expects, a power reading) and, with low light on, its latest such test
+    isn't weaker than the threshold. Otherwise the reason is what was wrong
+    with its latest test. A lookup that fails counts as "needs a retest" with
+    the sheet's reason, so nothing is silently dropped.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def check(retest):
+        if not retest.location_id:
+            return retest.reason
+        try:
+            records = [r for r in client.search_workflow(retest.location_id) if r.get("type") == TEST_TYPE]
+            readings = sorted((reading_from_search(r) for r in records if not is_multi_service(r)),
+                              key=lambda rd: rd.test_time)
+        except (StrataSyncError, ValueError):
+            return retest.reason
+        if not readings:
+            return f"{retest.label}: not tested in {retest.own_job}"
+        loc = readings[-1].location
+        index = indexes.get(loc.tab) if loc else None
+        row = index.rows.get(loc.key) if index else None
+        expected = index.get(row, index.column(loc.columns.expected_olt)) if row else None
+        passing = [rd for rd in readings if not reading_problems(rd, expected)]
+        if passing:
+            last = passing[-1]
+            limit = reissue.threshold(loc)
+            if reissue.low_light and last.power_dbm is not None and last.power_dbm < limit:
+                return f"{retest.label}: {last.power_dbm:g} dBm is weaker than {limit:g} dBm"
+            return None
+        return reading_problems(readings[-1], expected)[0].message
+
+    log(f"Re-issue: looking up {len(retests)} location(s) in StrataSync that the sheet has no passing result for")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(zip((r.label for r in retests), pool.map(check, retests)))
 
 
 def replace_cable(
@@ -254,21 +370,30 @@ def replace_cable(
     *,
     apply: bool,
     log: Log = print,
-) -> Tuple[str, CableReplacementPlan]:
+    jobs_for: Optional[StrataSyncSettings] = None,
+    template: str = "",
+) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan]]:
     """Plan (and if `apply`, write) the clearing of one cable's results.
 
-    Returns (sheet title, CableReplacementPlan). The sheet is read afresh each
-    time, so applying never relies on an earlier preview's values.
+    With `jobs_for` (the StrataSync account), also plans (and if `apply`,
+    creates) new unassigned jobs from `template` for the cable's rack cohorts,
+    covering the racks that are cleared. They're created after the sheet is
+    written; any that fail are reported on the returned plan.
+
+    Returns (sheet title, CableReplacementPlan, jobs plan or None). The sheet
+    is read afresh each time, so applying never relies on an earlier preview's values.
     """
     if replaced_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise ConfigError("The replacement time is in the future. Every test before it would be "
                           "ignored, including tests of the new cable.")
     with run_lock():
-        return _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log)
+        return _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log,
+                              jobs_for=jobs_for, template=template)
 
 
 def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, replaced_at: datetime,
-                   *, apply: bool, log: Log) -> Tuple[str, CableReplacementPlan]:
+                   *, apply: bool, log: Log, jobs_for: Optional[StrataSyncSettings], template: str,
+                   ) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan]]:
     writer = SheetWriter(settings)
     tab = rack_tab(data_hall)
     values = writer.read_tabs([tab]).get(tab)
@@ -277,12 +402,21 @@ def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, r
     plan = plan_cable_replacement(TabIndex.build(tab, values, RACK_KEY_HEADERS),
                                   data_hall, row, channel, replaced_at)
     cleared = sum(r.cleared for r in plan.racks)
+    jobs_plan = client = None
+    if jobs_for:
+        client = StrataSyncClient(jobs_for)
+        jobs = existing_jobs(client.search_jobs(JOBS_SINCE, datetime.now(timezone.utc) + timedelta(days=35)))
+        jobs_plan = plan_cable_jobs(data_hall, row, channel, [r.rack for r in plan.racks if r.cleared],
+                                    plan.replaced_at, jobs)
     if not apply:
-        return writer.spreadsheet.title, plan
+        return writer.spreadsheet.title, plan, jobs_plan
     n = writer.write_cells(plan.updates)
     log(f"Cable replaced: {plan.cable} at {plan.replaced_at}. Cleared {cleared} rack(s) "
         f"({n} cells) in '{tab}'" + (f", left {len(plan.racks) - cleared} alone" if cleared < len(plan.racks) else ""))
-    return writer.spreadsheet.title, plan
+    if jobs_plan and jobs_plan.jobs:
+        create_jobs(client, jobs_plan, template, log)
+        history.record_jobs(jobs_plan, history.CABLE, writer.spreadsheet.title, log)
+    return writer.spreadsheet.title, plan, jobs_plan
 
 
 FLAG_CSV_HEADER = history.FLAG_FIELDS

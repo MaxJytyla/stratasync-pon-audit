@@ -6,6 +6,7 @@ Each update (from the window or an automatic one) appends to CSV files in
   runs.csv      one row per update: when, how it was started, the outcome and counts
   flagged.csv   every flagged result, which was *not* written to the sheet
   written.csv   every result written: location, tab, cells, dBm, test time
+  jobs.csv      every job re-issued (or that failed to be): name, locations, why
 
 Automatic updates also append their progress messages to automatic.log.
 Nothing here is ever rewritten or pruned, so the files are an audit trail.
@@ -22,12 +23,14 @@ from .config import app_data_dir
 
 if TYPE_CHECKING:
     from .pon_audit import Flag
+    from .reissue import ReissuePlan
     from .sync import SyncResult
 
 Log = Callable[[str], None]
 
 MANUAL = "manual"
 AUTOMATIC = "automatic"
+CABLE = "cable replacement"
 
 RUNS_HEADER = ["run_at", "trigger", "status", "sheet", "searched_from", "searched_to", "found", "truepon",
                "new", "written", "flagged", "skipped", "cells_written", "download_failures",
@@ -36,6 +39,9 @@ FLAG_FIELDS = ["kind", "label", "message", "test_time", "tech", "serial_no", "so
 FLAGGED_HEADER = ["run_at", "trigger", "sheet"] + FLAG_FIELDS
 WRITTEN_HEADER = ["run_at", "trigger", "sheet", "label", "tab", "cells", "dbm", "test_time",
                   "sheet_time", "tech", "serial_no", "source"]
+
+JOBS_HEADER = ["run_at", "trigger", "sheet", "work_order_id", "status", "workflow_id", "cohort", "locations",
+               "reasons", "error"]
 
 LOG_MAX_BYTES = 5_000_000
 
@@ -85,12 +91,16 @@ def record_run(result: "SyncResult", trigger: str, log: Log = print) -> None:
     """Append an applied update, its flagged results and its written results to the history."""
     plan, run_at, sheet = result.plan, _now(), result.sheet_title
     skipped = sum(1 for _, why in plan.skipped if why != "flagged (not written)")
-    message = "; ".join(result.download_failures)
+    problems = result.download_failures + result.reissue_problems
+    message = "; ".join(problems)
+    if result.reissue and result.reissue.jobs:
+        created = sum(j.status == "created" for j in result.reissue.jobs)
+        message = "; ".join(filter(None, [f"re-issued {created} job(s)", message]))
     if result.missing_tabs:
         message = "; ".join(filter(None, [f"tabs not found: {', '.join(result.missing_tabs)}", message]))
     try:
         _append("runs.csv", RUNS_HEADER, [[
-            run_at, trigger, "partial" if result.download_failures else "ok", sheet,
+            run_at, trigger, "partial" if problems else "ok", sheet,
             _iso(result.start), _iso(result.end), result.found, result.truepon, result.new,
             len(plan.written), len(plan.flags), skipped, result.cells_written,
             len(result.download_failures), _iso(result.position_saved), message,
@@ -102,6 +112,21 @@ def record_run(result: "SyncResult", trigger: str, log: Log = print) -> None:
             for rd, power, stamp in plan.written_cells()], log)
     except OSError as exc:  # the sheet is already written; don't turn that into a failure
         log(f"Could not save the update history: {exc}")
+    if result.reissue:
+        record_jobs(result.reissue, trigger, sheet, log, run_at)
+
+
+def record_jobs(plan: "ReissuePlan", trigger: str, sheet: str, log: Log = print,
+                run_at: Optional[str] = None) -> None:
+    """Append the jobs an update or cable replacement created (or failed to) to jobs.csv."""
+    run_at = run_at or _now()
+    try:
+        _append("jobs.csv", JOBS_HEADER, [
+            [run_at, trigger, sheet, j.work_order_id, j.status, j.workflow_id or "", j.cohort,
+             " ".join(j.labels), " | ".join(r.reason for r in j.retests), j.error]
+            for j in plan.jobs], log)
+    except OSError as exc:
+        log(f"Could not save the job history: {exc}")
 
 
 def record_status(trigger: str, status: str, sheet: str, message: str, log: Log = print) -> None:

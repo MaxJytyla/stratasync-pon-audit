@@ -268,6 +268,7 @@ def run_automatic() -> int:
     try:
         ss = make_stratasync_settings(form.region, form.client_id, form.client_secret)
         settings = make_settings(form.sheet_id, form.service_account_json)
+        reissue = form.reissue_settings()
     except ConfigError as exc:
         message = f"The saved settings are incomplete: {exc}"
         if not form.remember_secrets:
@@ -277,7 +278,7 @@ def run_automatic() -> int:
         history.record_status(history.AUTOMATIC, "failed", form.sheet_id, message, log)
         return 1
     try:
-        result = run_sync(ss, settings, apply=True, log=log, trigger=history.AUTOMATIC)
+        result = run_sync(ss, settings, apply=True, log=log, trigger=history.AUTOMATIC, reissue=reissue)
     except RunInProgress as exc:
         log(f"Skipped: {exc}")
         history.record_status(history.AUTOMATIC, "skipped", settings.sheet_id, str(exc), log)
@@ -286,6 +287,7 @@ def run_automatic() -> int:
         log(f"Error: {error_text(exc)}")
         log(traceback.format_exc().rstrip())
         return 1
+    jobs = f", re-issued {sum(j.status == 'created' for j in result.reissue.jobs)} job(s)" if result.reissue else ""
     log(f"Automatic update finished: wrote {len(result.plan.written)} result(s), "
-        f"flagged {len(result.plan.flags)}")
-    return 1 if result.download_failures else 0
+        f"flagged {len(result.plan.flags)}{jobs}")
+    return 1 if result.download_failures or result.reissue_problems else 0

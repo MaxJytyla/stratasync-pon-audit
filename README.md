@@ -24,6 +24,7 @@ The builds aren't code-signed, which is why the first launch needs those extra s
    - **Skipped**: results that were superseded by a later test of the same location, or that are already in the sheet.
    - **Log**: progress messages and errors.
    - **History**: every update that wrote to the sheet, manual or automatic (see below).
+   - **Jobs**: the StrataSync jobs re-issued for locations that need a retest, if that's turned on (see below).
 
 **Search from** is normally left blank. Each update then continues from where the last one finished. Enter a date (`2026-10-22`) or a date and time (`2026-10-22 08:00`) to look further back. Re-running over the same period is safe, because results older than what's already in the sheet are skipped.
 
@@ -46,9 +47,27 @@ Every update that writes to the sheet is recorded, whether it was started from t
 | `runs.csv` | update: time, manual/automatic, outcome (`ok`, `partial` if some downloads failed, `failed`, `skipped`), search window, counts, error message |
 | `flagged.csv` | flagged result (not written to the sheet): problem, location, details, test time, tech, serial, StrataSync source |
 | `written.csv` | result written: location, tab, cells, dBm, test time, tech, serial, source |
+| `jobs.csv` | job re-issued, or that failed to be, by an update or a cable replacement: name, status, workflowId, cohort, locations, why, error |
 | `automatic.log` | progress message from an automatic update (it starts over at 5 MB, keeping one old copy as `automatic.log.1`) |
 
 The **History** tab lists the latest updates, and the **Automatic updates** section shows the outcome of the last automatic one. If a CSV is open in Excel when an update runs, Windows won't let the app add to it, so that update's rows go to a dated file next to it (e.g. `flagged-20261030-140000.csv`).
+
+### Re-issuing jobs
+
+Under **Re-issue jobs**, when **When an update finds locations that need a retest…** is ticked, every **Run update** (from the window or automatic) also creates StrataSync jobs for those locations. It and the low-light option are both ticked by default; untick them to turn re-issuing off.
+
+- **When:** once the job a location was tested in is **COMPLETED**. StrataSync sets that by itself when every required location has a result; nobody has to approve it. Until then a flagged location is listed as "waiting for … to be completed" (the tech may still retest it). Every update checks the jobs completed or approved in the last 14 days, and the job of any flagged result however old, so it doesn't matter which update saw which flag, or whether the job's last test was flagged. A flagged test that isn't part of any job is re-issued straight away.
+- **What counts as needing a retest:** a location of a completed job with no passing result in the sheet since the job's date (every test of it in the job was flagged: wrong OLT ID, no OLT ID, an unrecognized OLT ID or no power reading). A passing test earlier in the same job counts, so a stray later test of another port doesn't make a job. If the sheet has no result because no update has written it yet, the location's tests in the job are looked up in StrataSync first: if one passed, nothing is re-issued, and the summary says how many results the sheet is missing (run an update with an earlier **Search from** date to add them). Flags a retest can't fix (no row or expected OLT in the sheet, an unrecognized label, an unreadable file) aren't re-issued.
+- **Low light (optional):** tick **Also when the light is weaker than…** to also re-issue locations whose result in the sheet is below the levels you enter. The defaults are -11.3 dBm for rack tests and +2.9 dBm for F1 tests. These results are still written to the sheet exactly as before. Re-issuing only adds a job.
+- **One job per cohort:** all the locations of a completed job that need a retest go into one job per cohort, holding just those locations. The cohorts are C1 (racks 1–15), C2 (16–30), C3 (31–40) and F1 of one data hall row and channel. A whole cohort reading the wrong OLT ID gives one job of 15 racks (10 for C3), not 15 jobs.
+- **Names:** the cohort's own job name plus `RT<n>`, e.g. `RMN2.DHA.12 AA C2 RT1` or `RMN2.DHA.01 BB F1 RT2`. n is one more than the highest RT number that cohort already has in StrataSync, counting hand-made ones (`… C2 RT` counts as RT1). Locations get the standard labels (`RMN2.DHA.12.05A`, `RMN2.DHA.01.F1.02B`).
+- **Not assigned:** jobs are made from the **Job template** (`RMN-BB-PON-Test` by default), scheduled for today, and assigned to no technician. They wait in StrataSync's TPA job list, in the STARTED state, until someone assigns them. They aren't sent to any meter before that.
+- **No duplicates:** a location isn't re-issued again when another job holding it is already scheduled on or after the completed job's date (an earlier update re-issued it, or someone did by hand). The **Jobs** tab and the Log list these as "already in …". Re-running an update over the same period is still safe.
+- **Two people at once:** flagged results aren't written to the sheet, so two people running updates can both find the same ones. Right before each job is created, the app searches StrataSync's jobs again and leaves out locations someone else has re-issued in the meantime, logging "already re-issued in …, probably by someone else". If both create the same job at the same moment, StrataSync refuses the second (same name and date), and that app checks again and creates only what's still missing.
+- **Preview first:** **Preview (no changes)** lists the jobs it would create on the **Jobs** tab, without creating them.
+- **If a job can't be created:** the sheet is still written. The download position isn't moved, so the next update tries that job again. Jobs that were created aren't repeated. The run shows as `partial` in the history.
+
+Re-issuing uses the same client ID and secret as the test results. They need access to the StrataSync TPA Jobs API, and the service user needs permission to create jobs.
 
 ### Replacing a multi-drop cable
 
@@ -57,6 +76,8 @@ All the racks on one row and channel of a data hall share one multi-drop cable (
 1. Click **Replace cable…** and choose the data hall, row and channel. Set **Replaced at** to when the new cable went in (it defaults to now).
 2. Click **Preview**. A list shows every rack on that cable, with its current dBm and timestamp and what will happen to it. Nothing is changed yet.
 3. Click **Replace cable** and confirm.
+
+**Also create new jobs for the cable's rack cohorts** is ticked by default. It creates one job per rack cohort on that cable (C1, C2, C3), named and left unassigned as described under **Re-issuing jobs**, e.g. `RMN2.DHB.05 AA C1 RT1`. Each job covers the racks being cleared. No F1 jobs are created, since F1 is on a separate cable. The preview lists the jobs. Racks already in a job scheduled on or after the replacement day are left out, so recording the same replacement twice doesn't make a second set. The jobs are created after the sheet is written. If one fails, the message says so. Click **Replace cable** again with the same time to retry.
 
 For each rack, the app clears `dBm in Port 1` (channel A) or `dBm in Port 2` (channel B), and sets `Timestamp P1`/`P2` to the replacement time. That timestamp *is* the record of the replacement. Every update after that ignores tests on that cable from before it, over any time window, on any computer, and with the command-line script too. These show in **Skipped** as "tested before cable replacement". The first test after the replacement is written as normal. Racks already tested after the replacement time are left alone, and so are racks with a later replacement already recorded. Nothing else in the sheet is touched (OLT, Issue, Fix and the History tabs included). The old values can only be recovered from the sheet's version history.
 
@@ -123,13 +144,15 @@ git tag v1.0.0 && git push origin v1.0.0
 ```
 app.py                entry point (--auto-update: one update with the saved settings, no window)
 build.py              PyInstaller build
+scripts/smoke_gui.py  opens the window and checks sizing and scrolling (run by the Build workflow)
 viavi_results/
   gui.py              the window: settings form, run, report, CSV export
   sync.py             one sync run: search -> plan -> write, flags CSV, run lock
   scheduler.py        automatic updates: launchd / Task Scheduler, the headless run
   history.py          update history: runs.csv, flagged.csv, written.csv
   config.py           server URLs, settings validation, saved form, app data folder
-  stratasync.py       StrataSyncClient: login, search, file download
+  stratasync.py       StrataSyncClient: login, search, file download, job search/creation
+  reissue.py          which locations need a retest, grouping into cohort RT jobs, creating them
   pon_audit.py        test result -> PON Audit cells, OLT ID decoding, checks
   sheets.py           SheetWriter: batch read/write across the sheet's tabs
   sync_state.py       remembers the last download position

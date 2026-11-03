@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .reissue import DEFAULT_LOW_LIGHT_F1_DBM, DEFAULT_LOW_LIGHT_RACK_DBM, DEFAULT_TEMPLATE, ReissueSettings
+
 APP_NAME = "StrataSync PON Audit"
 
 
@@ -114,7 +116,29 @@ def make_stratasync_settings(region: str, client_id: str, client_secret: str) ->
     )
 
 
+def make_reissue_settings(enabled: bool, low_light: bool, rack_dbm: str, f1_dbm: str,
+                          template: str) -> ReissueSettings:
+    """Validate the job re-issue options. The thresholds are only checked when used."""
+    template = template.strip()
+    if enabled and not template:
+        raise ConfigError("Enter the StrataSync job template that re-issued jobs are made from.")
+    values = []
+    for text, what in ((rack_dbm, "rack-level"), (f1_dbm, "F1")):
+        try:
+            values.append(float(str(text).strip()))
+        except ValueError:
+            if enabled and low_light:
+                raise ConfigError(f"The {what} low-light level must be a number of dBm, like -11.3.") from None
+            values.append(DEFAULT_LOW_LIGHT_RACK_DBM if what == "rack-level" else DEFAULT_LOW_LIGHT_F1_DBM)
+    return ReissueSettings(enabled=enabled, low_light=low_light, rack_dbm=values[0], f1_dbm=values[1],
+                           template=template)
+
+
 # ---- remembered form values -------------------------------------------------------
+
+
+# 2: re-issuing jobs (and on low light) became on by default.
+SETTINGS_VERSION = 2
 
 
 @dataclass
@@ -128,6 +152,17 @@ class SavedForm:
     sheet_id: str = ""
     remember_secrets: bool = True
     auto_update_minutes: int = 60
+    reissue_enabled: bool = True
+    reissue_low_light: bool = True
+    low_light_rack_dbm: str = str(DEFAULT_LOW_LIGHT_RACK_DBM)
+    low_light_f1_dbm: str = str(DEFAULT_LOW_LIGHT_F1_DBM)
+    job_template: str = DEFAULT_TEMPLATE
+    # Bumped when a default changes in a way saved settings shouldn't keep; see load().
+    version: int = SETTINGS_VERSION
+
+    def reissue_settings(self) -> ReissueSettings:
+        return make_reissue_settings(self.reissue_enabled, self.reissue_low_light, self.low_light_rack_dbm,
+                                     self.low_light_f1_dbm, self.job_template)
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "SavedForm":
@@ -137,6 +172,11 @@ class SavedForm:
         except (OSError, ValueError):
             return cls()
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        if known.get("version", 1) < 2:
+            # Saved before re-issuing was on by default, when "off" was only the old default.
+            known.pop("reissue_enabled", None)
+            known.pop("reissue_low_light", None)
+        known["version"] = SETTINGS_VERSION
         return cls(**known)
 
     def save(self, path: Optional[Path] = None) -> None:

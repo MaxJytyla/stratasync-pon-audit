@@ -457,6 +457,11 @@ class Flag:
     reading: Optional[TestReading] = None
 
 
+def reading_problems(reading: TestReading, expected: Any) -> List[Flag]:
+    """What's wrong with a reading, given the sheet's expected OLT ID for its location."""
+    return _reading_problems(reading, expected)
+
+
 def _reading_problems(reading: TestReading, expected: Any) -> List[Flag]:
     expected_str = " ".join(str(expected or "").split()).upper()
     olt = reading.olt_id

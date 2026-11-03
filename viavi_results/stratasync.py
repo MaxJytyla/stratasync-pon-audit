@@ -30,6 +30,8 @@ from .config import StrataSyncSettings
 
 TOKEN_PATH = "/oauth/token"
 SEARCH_PATH = "/api/v1/testresults/search"
+JOB_SEARCH_PATH = "/api/v3/workflow/search"
+JOB_CREATE_PATH = "/api/v3/workflow/workorder"
 
 # Values for DateRange.dateFilter (guide p.22).
 TODAY = -1
@@ -49,6 +51,8 @@ _TOKEN_MARGIN_S = 60
 
 # Longest span one search may cover (the API allows at most 24 hours).
 _MAX_WINDOW = timedelta(hours=24) - timedelta(seconds=1)
+# Longest span one job search may cover (the Jobs API allows at most 35 days).
+_MAX_JOB_WINDOW = timedelta(days=35) - timedelta(seconds=1)
 
 DateLike = Union[str, date, datetime]
 
@@ -113,6 +117,8 @@ class StrataSyncClient:
             respect_retry_after_header=True,
         )
         self._session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
+        # Changes (creating jobs) are sent once and never retried automatically.
+        self._write_session = requests.Session()
 
     # ---- auth -------------------------------------------------------------
 
@@ -185,12 +191,14 @@ class StrataSyncClient:
             )
         return list(body.get("result") or [])
 
-    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_json(self, path: str, payload: Dict[str, Any],
+                   session: Optional[requests.Session] = None) -> Dict[str, Any]:
         url = self._settings.base_url + path
         token = None
         for attempt in (1, 2):
             token = self._bearer(force_refresh=attempt == 2, rejected=token)
-            resp = self._session.post(
+            # A 401 means nothing was done, so even a change can be resent after it.
+            resp = (session or self._session).post(
                 url,
                 json=payload,
                 headers={
@@ -209,7 +217,8 @@ class StrataSyncClient:
         except ValueError:
             body = None
         if resp.status_code != 200 or not isinstance(body, dict):
-            message = body.get("message") if isinstance(body, dict) else resp.text[:500]
+            message = (" ".join(filter(None, (body.get("message"), body.get("detailMessage"))))
+                       if isinstance(body, dict) else resp.text[:500])
             hint = ""
             if resp.status_code == 401 and not self._can_refresh:
                 hint = " (access token may have expired; tokens last ~15 minutes)"
@@ -361,6 +370,67 @@ class StrataSyncClient:
         except ValueError:
             # Some files are stored gzipped (format application/zip / .json.gz).
             return json.loads(gzip.decompress(content))
+
+
+    # ---- jobs (TPA Jobs JSON API v3) ---------------------------------------
+    #
+    # Reference: "StrataSync TPA Jobs JSON API Developer Guide" (Feb 2025). The
+    # same client credentials and token are used (only one token is valid per
+    # client ID, so a second client would cancel this one's).
+
+    def search_jobs(self, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        """Every job scheduled from `start` to `end` (timezone-aware, inclusive).
+
+        The API allows at most 35 days per search, so longer spans are split.
+        Each job is a CDM 2.2 record with 'state', 'tests' and 'workflow'
+        (workflowId, workOrderId, date). De-duplicated by workflowId.
+        """
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("start and end must be timezone-aware")
+        seen: Dict[Any, Dict[str, Any]] = {}
+        window_start = start
+        while window_start <= end:
+            window_end = min(window_start + _MAX_JOB_WINDOW, end)
+            body = self._post_json(JOB_SEARCH_PATH, {"workflow.date": date_range(window_start, window_end)})
+            jobs = (body.get("result") or {}).get("cdm") or []
+            size = body.get("size")
+            if isinstance(size, int) and size > len(jobs):
+                raise StrataSyncError(f"Job search returned {len(jobs)} of {size} jobs", body=body)
+            for job in jobs:
+                seen.setdefault((job.get("workflow") or {}).get("workflowId"), job)
+            window_start = window_end + timedelta(seconds=1)
+        return list(seen.values())
+
+    def create_job_from_template(
+        self,
+        work_order_id: str,
+        template_name: str,
+        scheduled: datetime,
+        location_labels: Sequence[str],
+    ) -> Dict[str, Any]:
+        """Create a job from a StrataSync job template, assigned to no technician.
+
+        With no techId the job goes to the account's root organization in the
+        STARTED state, and isn't sent to any meter until someone assigns it.
+        Returns the created job (its 'workflow' holds the new workflowId).
+
+        Sent once and never retried automatically: if the response is lost, a
+        retry could create a second job. StrataSync itself refuses a second job
+        with the same work order ID and scheduled date.
+        """
+        payload = {
+            "workOrder": {
+                "id": work_order_id,
+                "templateName": template_name,
+                "scheduledDate": _fmt_date(scheduled),
+            },
+            "testLocations": [{"label": label, "required": True} for label in location_labels],
+        }
+        body = self._post_json(JOB_CREATE_PATH, payload, session=self._write_session)
+        if body.get("type") != "success":
+            raise StrataSyncError(f"Job creation failed: {body.get('message') or body}",
+                                  status=body.get("httpStatus"), body=body)
+        return (body.get("result") or {}).get("cdm") or {}
 
 
 def _days(start: date, end: date) -> Iterable[date]:
