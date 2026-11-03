@@ -38,12 +38,16 @@ def main() -> int:
         root.update()
         return app.canvas.yview()[0]
 
-    app._on_wheel(Event(app.summary, -120))  # one notch down
+    # One wheel notch down: a delta of 120 on Windows and with Tk 9, about 1 with Tk 8.6 on macOS.
+    notch = 1 if sys.platform == "darwin" and tk.TkVersion < 9 else 120
+    app._on_wheel(Event(app.summary, -notch))
     after_notch = top()
     assert 0 < after_notch < 0.3, f"one wheel notch scrolled to {after_notch}"
-    app._on_wheel(Event(app.summary, -40))  # a small precision-touchpad step
-    assert 0 < top() - after_notch < 0.1, "a small touchpad delta scrolled too far"
-    app._on_wheel(Event(app.flag_tree, -120))  # over a list: the list scrolls, not the window
+    if notch == 120:
+        app._on_wheel(Event(app.summary, -40))  # a small precision-touchpad step (Windows)
+        assert 0 < top() - after_notch < 0.1, "a small touchpad delta scrolled too far"
+        after_notch = top()
+    app._on_wheel(Event(app.flag_tree, -notch))  # over a list: the list scrolls, not the window
     assert top() - after_notch < 0.1
     app._on_touchpad(Event(app.summary, 30 & 0xFFFF))  # Tk 9 trackpad, 30 px up
     app.canvas.yview_moveto(0)
