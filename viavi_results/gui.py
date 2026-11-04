@@ -18,12 +18,13 @@ from .config import (
     STRATASYNC_URLS,
     ConfigError,
     SavedForm,
+    cable_ids_path,
     make_reissue_settings,
     make_settings,
     make_stratasync_settings,
     parse_service_account,
 )
-from . import history, scheduler
+from . import cable_ids, history, scheduler
 from .pon_audit import DATA_HALLS
 from .sync import SyncResult, error_text as _error_text, last_position, replace_cable, run_sync, write_flags_csv
 
@@ -292,9 +293,48 @@ class App(ttk.Frame):
                   foreground="gray", wraplength=840, justify="left").grid(row=2, column=0, columnspan=8,
                                                                           sticky="w", pady=(2, 0))
 
+        ttk.Label(box, text="Cable ID file:").grid(row=3, column=0, sticky="w", pady=(PAD, 0))
+        self.cable_ids_file = tk.StringVar()
+        ttk.Entry(box, textvariable=self.cable_ids_file, width=60).grid(row=3, column=1, columnspan=5, sticky="ew",
+                                                                        padx=(PAD, 0), pady=(PAD, 0))
+        files = ttk.Frame(box)
+        files.grid(row=3, column=6, columnspan=2, sticky="w", padx=(PAD, 0), pady=(PAD, 0))
+        ttk.Button(files, text="Choose…", command=self._choose_cable_ids_file).pack(side="left")
+        ttk.Button(files, text="Show", command=lambda: _open_folder(self._cable_ids_path().parent)
+                   ).pack(side="left", padx=(PAD, 0))
+        self.cable_ids_status = ttk.Label(box, text="", foreground="gray", wraplength=840, justify="left")
+        self.cable_ids_status.grid(row=4, column=0, columnspan=8, sticky="w", pady=(2, 0))
+        self.cable_ids_file.trace_add("write", lambda *_: self._update_cable_ids_status())
+
+    def _cable_ids_path(self) -> Path:
+        return cable_ids_path(self.cable_ids_file.get())
+
+    def _choose_cable_ids_file(self) -> None:
+        current = self._cable_ids_path()
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Choose the Cable ID file", initialdir=str(current.parent),
+            initialfile=current.name, filetypes=[("CSV", "*.csv"), ("All files", "*")])
+        if path:
+            self.cable_ids_file.set(path)
+
+    def _update_cable_ids_status(self) -> None:
+        path = self._cable_ids_path()
+        where = "" if self.cable_ids_file.get().strip() else " (leave the box blank for this default)"
+        try:
+            lookup = cable_ids.load(path)
+        except cable_ids.CableIdFileError as exc:
+            text = f"{exc}"
+        else:
+            text = (f"{path}{where}: {lookup.describe()}." if path.exists() else
+                    f"{path}{where} doesn't exist yet, so new rack jobs get a blank Cable ID.")
+        self.cable_ids_status.configure(text=(
+            text + f" Rack jobs get their row and channel's cable base serial from it; F1 jobs get "
+            f"{cable_ids.F1_CABLE_ID}. Columns: Cable (e.g. RMN2.DHA.01 AA), Cable ID (may be blank)."))
+
     def _reissue_settings(self):
         return make_reissue_settings(self.reissue_enabled.get(), self.reissue_low_light.get(),
-                                     self.rack_dbm.get(), self.f1_dbm.get(), self.job_template.get())
+                                     self.rack_dbm.get(), self.f1_dbm.get(), self.job_template.get(),
+                                     self.cable_ids_file.get())
 
     def _build_actions(self) -> None:
         bar = ttk.Frame(self)
@@ -379,8 +419,8 @@ class App(ttk.Frame):
 
         jobs_frame = ttk.Frame(self.tabs)
         self.jobs_tree = self._tree(
-            jobs_frame, ("job", "status", "locations", "why"),
-            ("Job", "Status", "Locations", "Why"), (200, 150, 260, 330))
+            jobs_frame, ("job", "status", "cable", "locations", "why"),
+            ("Job", "Status", "Cable ID", "Locations", "Why"), (190, 150, 130, 230, 290))
         ttk.Label(jobs_frame, text="Jobs re-issued for locations that need a retest (also in jobs.csv).",
                   foreground="gray", wraplength=820, justify="left").grid(row=1, column=0, columnspan=2,
                                                                           sticky="w", pady=(PAD, 0))
@@ -420,6 +460,8 @@ class App(ttk.Frame):
         self.rack_dbm.set(s.low_light_rack_dbm)
         self.f1_dbm.set(s.low_light_f1_dbm)
         self.job_template.set(s.job_template)
+        self.cable_ids_file.set(s.cable_ids_file)
+        self._update_cable_ids_status()
         if s.auto_update_minutes % 60:
             self.every.set(str(s.auto_update_minutes))
             self.every_unit.set("minutes")
@@ -445,6 +487,7 @@ class App(ttk.Frame):
             low_light_rack_dbm=self.rack_dbm.get().strip(),
             low_light_f1_dbm=self.f1_dbm.get().strip(),
             job_template=self.job_template.get().strip(),
+            cable_ids_file=self.cable_ids_file.get().strip(),
         )
 
     def _interval_minutes(self, strict: bool = True) -> int:
@@ -734,16 +777,20 @@ class App(ttk.Frame):
                 status = {"created": f"created ({job.workflow_id}{org})", "failed": f"failed: {job.error}",
                           "already re-issued": "not created: already re-issued (see below)",
                           "planned": (f"would create{org}" if not r.applied else "not created")}[job.status]
+                if job.cable_id_error:
+                    status += f"; Cable ID not set: {job.cable_id_error}"
                 self.jobs_tree.insert("", "end", values=(
-                    job.work_order_id, status, " ".join(job.labels), " | ".join(t.reason for t in job.retests)))
+                    job.work_order_id, status, job.cable_id or "(blank)", " ".join(job.labels),
+                    " | ".join(t.reason for t in job.retests)))
             for retest, existing in plan.already_reissued:
                 self.jobs_tree.insert("", "end", values=(
-                    "", f"already in {existing}", retest.label, retest.reason))
+                    "", f"already in {existing}", "", retest.label, retest.reason))
             for retest, job in plan.waiting:
                 self.jobs_tree.insert("", "end", values=(
-                    "", f"waiting for {job} to be completed", retest.label, retest.reason))
+                    "", f"waiting for {job} to be completed", "", retest.label, retest.reason))
             for retest, why in plan.not_reissued:
-                self.jobs_tree.insert("", "end", values=("", f"not re-issued: {why}", retest.label, retest.reason))
+                self.jobs_tree.insert("", "end", values=("", f"not re-issued: {why}", "", retest.label,
+                                                         retest.reason))
             self.tabs.tab(self.JOBS_TAB, text=f"Jobs ({len(plan.jobs)})")
         if r.reissue_error:
             return f"Jobs could not be re-issued: {r.reissue_error}"
@@ -752,6 +799,12 @@ class App(ttk.Frame):
             f" for {sum(len(j.retests) for j in plan.jobs)} location(s); see the Jobs tab.")
         if plan.failures:
             line += f" {len(plan.failures)} failed, so the download position was not moved; the next update retries them."
+        no_cable_id = [j.work_order_id for j in plan.jobs if j.status in ("created", "planned") and not j.cable_id]
+        if no_cable_id:
+            line += f" {len(no_cable_id)} job(s) {'get' if not r.applied else 'got'} a blank Cable ID (none on file)."
+        unset = [j.work_order_id for j in plan.jobs if j.cable_id_error]
+        if unset:
+            line += f" Cable ID couldn't be set on {', '.join(unset)}; set it by hand in StrataSync."
         if plan.waiting:
             line += f" {len(plan.waiting)} location(s) waiting for their job to be completed."
         if plan.sheet_behind:
@@ -873,6 +926,14 @@ class CableDialog(tk.Toplevel):
                                    "assigned to no technician",
                         variable=self.make_jobs).grid(row=3, column=0, columnspan=8, sticky="w", pady=(PAD, 0))
 
+        ttk.Label(form, text="New cable ID:").grid(row=4, column=0, sticky="w", pady=(PAD, 0))
+        self.new_cable_id = tk.StringVar()
+        ttk.Entry(form, textvariable=self.new_cable_id, width=24).grid(row=4, column=1, columnspan=3, sticky="w",
+                                                                      padx=(PAD, 0), pady=(PAD, 0))
+        ttk.Label(form, text="The new cable's base serial (e.g. S7XXXXXXXX031). Leave it blank if it isn't known "
+                             "yet. It replaces the old cable's ID in the Cable ID file, and the new jobs get it.",
+                  foreground="gray", wraplength=600, justify="left").grid(row=5, column=0, columnspan=8, sticky="w")
+
         self.status = ttk.Label(self, text="Choose the cable and click Preview to see which racks will be cleared.",
                                 wraplength=620, justify="left", padding=(PAD * 2, 0))
         self.status.grid(row=1, column=0, sticky="ew")
@@ -888,7 +949,7 @@ class CableDialog(tk.Toplevel):
         self.apply_btn = ttk.Button(buttons, text="Replace cable", command=self._apply, state="disabled")
         self.apply_btn.pack(side="left", padx=(PAD, 0))
 
-        for var in (self.data_hall, self.row, self.channel, self.when, self.make_jobs):
+        for var in (self.data_hall, self.row, self.channel, self.when, self.make_jobs, self.new_cable_id):
             var.trace_add("write", lambda *_: self._invalidate())
 
     def _inputs(self):
@@ -899,13 +960,15 @@ class CableDialog(tk.Toplevel):
         return self.data_hall.get(), row, self.channel.get(), _parse_when(self.when.get())
 
     def _job_options(self) -> dict:
-        """replace_cable's job arguments: none unless 'create new jobs' is ticked."""
+        """replace_cable's options: the new cable ID, and the jobs to create if 'create new jobs' is ticked."""
+        options = {"new_cable_id": self.new_cable_id.get().strip(),
+                   "cable_ids_file": self.app.cable_ids_file.get().strip()}
         if not self.make_jobs.get():
-            return {}
+            return options
         template = self.app.job_template.get().strip()
         if not template:
             raise ConfigError("Enter the job template under Re-issue jobs in the main window.")
-        return {"jobs_for": self.app.stratasync_settings(), "template": template}
+        return {**options, "jobs_for": self.app.stratasync_settings(), "template": template}
 
     def _invalidate(self) -> None:
         self.previewed = None
@@ -923,7 +986,7 @@ class CableDialog(tk.Toplevel):
                                    lambda res: self._show_preview((inputs, options), *res), self._failed):
             self.status.configure(text="Wait for the current run to finish, then click Preview again.")
 
-    def _show_preview(self, inputs, sheet_title, plan, jobs_plan) -> None:
+    def _show_preview(self, inputs, sheet_title, plan, jobs_plan, change) -> None:
         if not self.winfo_exists():
             return
         self.tree.delete(*self.tree.get_children())
@@ -939,20 +1002,22 @@ class CableDialog(tk.Toplevel):
             if jobs_plan.already_reissued:
                 jobs += (f"{len(jobs_plan.already_reissued)} rack(s) left out, already in a job from the "
                          f"replacement day on: " + ", ".join(sorted({e for _, e in jobs_plan.already_reissued})) + ". ")
+        cable_line = _cable_id_line(change)
         self.status.configure(text=(
             f"{plan.cable} in '{sheet_title}': {len(plan.racks)} rack(s), {cleared} to clear. {jobs}"
-            "Nothing has been changed yet."))
-        self.previewed = (inputs, sheet_title, plan.cable, plan.replaced_at, cleared, jobs_plan)
+            f"{cable_line} Nothing has been changed yet."))
+        self.previewed = (inputs, sheet_title, plan.cable, plan.replaced_at, cleared, jobs_plan, cable_line)
         self.apply_btn.configure(state="normal" if cleared else "disabled")
 
     def _apply(self) -> None:
         if not self.previewed:
             return
-        (inputs, options), sheet_title, cable, stamp, cleared, jobs_plan = self.previewed
+        (inputs, options), sheet_title, cable, stamp, cleared, jobs_plan, cable_line = self.previewed
         jobs = ""
         if jobs_plan and jobs_plan.jobs:
             jobs = (f"{len(jobs_plan.jobs)} new job(s) will be created, assigned to no technician: "
                     + ", ".join(j.work_order_id for j in jobs_plan.jobs) + ".\n\n")
+        jobs += cable_line + "\n\n"
         if not messagebox.askyesno(APP_NAME, (
                 f"Replace {cable} in '{sheet_title}'?\n\n"
                 f"The dBm of {cleared} rack(s) will be cleared and their timestamps set to {stamp}. "
@@ -967,9 +1032,18 @@ class CableDialog(tk.Toplevel):
             self._applied, self._failed)
 
     def _applied(self, res) -> None:
-        sheet_title, plan, jobs_plan = res
+        sheet_title, plan, jobs_plan, change = res
         cleared = sum(r.cleared for r in plan.racks)
         message = f"Replaced {plan.cable}: cleared {cleared} rack(s) in '{sheet_title}'."
+        if change and change.error:
+            message += (f"\n\nThe Cable ID file wasn't updated ({change.error}). Enter {change.cable} = "
+                        f"{change.new or '(blank)'} in it by hand.")
+        elif change:
+            message += f"\n\nCable ID file: {change.cable} is now {change.new or '(blank)'} (was {change.old or '(blank)'})."
+        unset = [j for j in (jobs_plan.jobs if jobs_plan else []) if j.cable_id_error]
+        if unset:
+            message += "\n\nCable ID couldn't be set on: " + ", ".join(j.work_order_id for j in unset) + (
+                ". Set it by hand in StrataSync.")
         if jobs_plan and jobs_plan.jobs:
             made = [j.work_order_id for j in jobs_plan.jobs if j.status == "created"]
             message += "\n\nCreated job(s): " + (", ".join(made) or "none") + "."
@@ -978,7 +1052,8 @@ class CableDialog(tk.Toplevel):
                     f"{j.work_order_id} ({j.error})" for j in jobs_plan.failures) + (
                     "\n\nThe cable replacement itself was recorded. Click Replace cable again with the same "
                     "time to retry: racks already in a new job are left out.")
-        show = messagebox.showwarning if jobs_plan and jobs_plan.failures else messagebox.showinfo
+        show = (messagebox.showwarning if (jobs_plan and jobs_plan.failures) or unset or (change and change.error)
+                else messagebox.showinfo)
         show(APP_NAME, message, parent=self if self.winfo_exists() else self.app.root)
         if self.winfo_exists():
             self.destroy()
@@ -988,6 +1063,15 @@ class CableDialog(tk.Toplevel):
         if self.winfo_exists():
             self.status.configure(text="Failed; see the message.")
         messagebox.showerror(APP_NAME, _error_text(exc), parent=self if self.winfo_exists() else self.app.root)
+
+
+def _cable_id_line(change) -> str:
+    """The Cable ID file change a cable replacement will make, in words."""
+    if change is None:
+        return ""
+    new = change.new or "blank (not known yet)"
+    return (f"Cable ID file ({change.file.name}): {change.cable} {change.old or '(blank)'} will be replaced by "
+            f"{new}" + (f"; the new jobs get {change.new}." if change.new else "; the new jobs get a blank Cable ID."))
 
 
 def main() -> None:

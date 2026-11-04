@@ -6,7 +6,8 @@ Each update (from the window or an automatic one) appends to CSV files in
   runs.csv      one row per update: when, how it was started, the outcome and counts
   flagged.csv   every flagged result, which was *not* written to the sheet
   written.csv   every result written: location, tab, cells, dBm, test time
-  jobs.csv      every job re-issued (or that failed to be): name, locations, why
+  jobs.csv      every job re-issued (or that failed to be): name, locations, why, Cable ID
+  cable_ids.csv every change a cable replacement made to the Cable ID lookup file
 
 Automatic updates also append their progress messages to automatic.log.
 Nothing here is ever rewritten or pruned, so the files are an audit trail.
@@ -41,7 +42,8 @@ WRITTEN_HEADER = ["run_at", "trigger", "sheet", "label", "tab", "cells", "dbm", 
                   "sheet_time", "tech", "serial_no", "source"]
 
 JOBS_HEADER = ["run_at", "trigger", "sheet", "work_order_id", "status", "workflow_id", "cohort", "locations",
-               "reasons", "error"]
+               "reasons", "error", "cable_id", "cable_id_error"]
+CABLE_IDS_HEADER = ["run_at", "sheet", "cable", "replaced_at", "old_cable_id", "new_cable_id", "file", "error"]
 
 LOG_MAX_BYTES = 5_000_000
 
@@ -63,12 +65,25 @@ def flag_row(f: "Flag") -> list:
     return [f.kind, r and r.label, f.message, r and r.test_time, r and r.tech_name, r and r.serial_no, r and r.source]
 
 
+def _last_header(path: Path, first: str) -> List[str]:
+    """The newest header row in an existing file (one starting with `first`)."""
+    last: List[str] = []
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        for row in csv.reader(fh):
+            if row and row[0] == first:
+                last = row
+    return last
+
+
 def _write(path: Path, header: Sequence[str], rows: Iterable[Sequence]) -> None:
     new = not path.exists() or path.stat().st_size == 0
+    # A file started by an older version has fewer columns. It's only ever
+    # added to, so the new header goes in as a row before the longer rows.
+    changed = not new and _last_header(path, header[0]) != list(header)
     # utf-8-sig so Excel reads it correctly; the BOM is only written at the start of the file.
     with path.open("a", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        if new:
+        if new or changed:
             w.writerow(header)
         w.writerows(rows)
 
@@ -123,10 +138,19 @@ def record_jobs(plan: "ReissuePlan", trigger: str, sheet: str, log: Log = print,
     try:
         _append("jobs.csv", JOBS_HEADER, [
             [run_at, trigger, sheet, j.work_order_id, j.status, j.workflow_id or "", j.cohort,
-             " ".join(j.labels), " | ".join(r.reason for r in j.retests), j.error]
+             " ".join(j.labels), " | ".join(r.reason for r in j.retests), j.error, j.cable_id, j.cable_id_error]
             for j in plan.jobs], log)
     except OSError as exc:
         log(f"Could not save the job history: {exc}")
+
+
+def record_cable_id(change, replaced_at: str, sheet: str, log: Log = print) -> None:
+    """Append a cable replacement's change to the Cable ID lookup file to cable_ids.csv."""
+    try:
+        _append("cable_ids.csv", CABLE_IDS_HEADER, [[
+            _now(), sheet, change.cable, replaced_at, change.old, change.new, str(change.file), change.error]], log)
+    except OSError as exc:
+        log(f"Could not save the Cable ID history: {exc}")
 
 
 def record_status(trigger: str, status: str, sheet: str, message: str, log: Log = print) -> None:

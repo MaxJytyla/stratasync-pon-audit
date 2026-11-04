@@ -47,7 +47,8 @@ Every update that writes to the sheet is recorded, whether it was started from t
 | `runs.csv` | update: time, manual/automatic, outcome (`ok`, `partial` if some downloads failed, `failed`, `skipped`), search window, counts, error message |
 | `flagged.csv` | flagged result (not written to the sheet): problem, location, details, test time, tech, serial, StrataSync source |
 | `written.csv` | result written: location, tab, cells, dBm, test time, tech, serial, source |
-| `jobs.csv` | job re-issued, or that failed to be, by an update or a cable replacement: name, status, workflowId, cohort, locations, why, error |
+| `jobs.csv` | job re-issued, or that failed to be, by an update or a cable replacement: name, status, workflowId, cohort, locations, why, error, Cable ID, and why the Cable ID couldn't be set (files from before Cable IDs get the new header as a row before the first longer row) |
+| `cable_ids.csv` | change a cable replacement made to the Cable ID file: cable, replacement time, old and new Cable ID |
 | `automatic.log` | progress message from an automatic update (it starts over at 5 MB, keeping one old copy as `automatic.log.1`) |
 
 The **History** tab lists the latest updates, and the **Automatic updates** section shows the outcome of the last automatic one. If a CSV is open in Excel when an update runs, Windows won't let the app add to it, so that update's rows go to a dated file next to it (e.g. `flagged-20261030-140000.csv`).
@@ -61,11 +62,28 @@ Under **Re-issue jobs**, when **When an update finds locations that need a retes
 - **Low light (optional):** tick **Also when the light is weaker than…** to also re-issue locations whose result in the sheet is below the levels you enter. The defaults are -11.3 dBm for rack tests and +2.9 dBm for F1 tests. These results are still written to the sheet exactly as before. Re-issuing only adds a job.
 - **One job per cohort:** all the locations of a completed job that need a retest go into one job per cohort, holding just those locations. The cohorts are C1 (racks 1–15), C2 (16–30), C3 (31–40) and F1 of one data hall row and channel. A whole cohort reading the wrong OLT ID gives one job of 15 racks (10 for C3), not 15 jobs.
 - **Names:** the cohort's own job name plus `RT<n>`, e.g. `RMN2.DHA.12 AA C2 RT1` or `RMN2.DHA.01 BB F1 RT2`. n is one more than the highest RT number that cohort already has in StrataSync, counting hand-made ones (`… C2 RT` counts as RT1). Locations get the standard labels (`RMN2.DHA.12.05A`, `RMN2.DHA.01.F1.02B`).
+- **Cable ID:** each new job gets its cable's Cable ID from the **Cable ID file** (see below). Every rack job of a data hall row and channel gets that cable's base serial, whatever the cohort; F1 jobs get `N/A (Trunk Fiber)`. A cable with no Cable ID in the file (or not in it) gets a blank one, and the Jobs tab and Log say so. The Cable ID is set right after the job is created. If that fails, the job is kept and the failure is shown on the Jobs tab, in the Log and in `jobs.csv`, so the Cable ID can be entered by hand.
 - **Not assigned, in the right organization:** jobs are made from the **Job template** (`RMN-BB-PON-Test` by default), scheduled for today, and assigned to no technician. Each goes into the same StrataSync organization as the job it re-issues (BlackBox RMN for the RMN sites); a cable replacement's jobs go where that cable's earlier jobs are. They wait in the STARTED state until someone assigns them, and aren't sent to any meter before that. (Without an organization, StrataSync would put them in the account's top organization, BlackBox.)
 - **No duplicates:** a location isn't re-issued again when another job holding it is already scheduled on or after the completed job's date (an earlier update re-issued it, or someone did by hand). The **Jobs** tab and the Log list these as "already in …". Re-running an update over the same period is still safe.
 - **Two people at once:** flagged results aren't written to the sheet, so two people running updates can both find the same ones. Right before each job is created, the app searches StrataSync's jobs again and leaves out locations someone else has re-issued in the meantime, logging "already re-issued in …, probably by someone else". If both create the same job at the same moment, StrataSync refuses the second (same name and date), and that app checks again and creates only what's still missing.
 - **Preview first:** **Preview (no changes)** lists the jobs it would create on the **Jobs** tab, without creating them.
 - **If a job can't be created:** the sheet is still written. The download position isn't moved, so the next update tries that job again. Jobs that were created aren't repeated. The run shows as `partial` in the history.
+
+#### The Cable ID file
+
+A CSV with one row per multi-drop cable, chosen under **Re-issue jobs → Cable ID file** (leave the box blank for `cable_ids.csv` in the app's data folder). **Show** opens its folder. The line below the box says how many cables it has and how many have no Cable ID yet.
+
+```
+Cable,Cable ID
+RMN2.DHA.01 AA,S7XXXXXXXX031
+RMN2.DHB.12 BB,
+```
+
+- `Cable` is the data hall, row and channel (`RMN2.DHA.01 AA`). `Cable ID` is the cable's base serial. Cohort 2 spans both legs of a cable (`.100A` and `.200A`), so the base serial is used for every cohort, not a leg serial.
+- A blank Cable ID is fine (a cable whose serial isn't known yet). Fill it in later; jobs created after that get it.
+- If the file can't be read (a cable listed twice, a line that isn't a cable), updates still write the sheet but don't re-issue jobs until it's fixed, so no jobs are created with blank Cable IDs by mistake.
+- A cable replacement writes the new cable's ID over the old one (see below).
+- Each computer has its own file unless you point **Cable ID file** at a shared one (e.g. on a shared drive). A replacement recorded on one computer only updates the file that computer uses.
 
 Re-issuing uses the same client ID and secret as the test results. They need access to the StrataSync TPA Jobs API, and the service user needs permission to create jobs.
 
@@ -73,13 +91,17 @@ Re-issuing uses the same client ID and secret as the test results. They need acc
 
 All the racks on one row and channel of a data hall share one multi-drop cable (e.g. DHB row 5 channel A). When a cable is replaced, its old results no longer mean anything:
 
-1. Click **Replace cable…** and choose the data hall, row and channel. Set **Replaced at** to when the new cable went in (it defaults to now).
+1. Click **Replace cable…** and choose the data hall, row and channel. Set **Replaced at** to when the new cable went in (it defaults to now). Enter the **New cable ID** (the new cable's base serial), or leave it blank if it isn't known yet.
 2. Click **Preview**. A list shows every rack on that cable, with its current dBm and timestamp and what will happen to it. Nothing is changed yet.
 3. Click **Replace cable** and confirm.
 
-**Also create new jobs for the cable's rack cohorts** is ticked by default. It creates one job per rack cohort on that cable (C1, C2, C3), named and left unassigned as described under **Re-issuing jobs**, e.g. `RMN2.DHB.05 AA C1 RT1`. Each job covers the racks being cleared. No F1 jobs are created, since F1 is on a separate cable. The preview lists the jobs. Racks already in a job scheduled on or after the replacement day are left out, so recording the same replacement twice doesn't make a second set. The jobs are created after the sheet is written. If one fails, the message says so. Click **Replace cable** again with the same time to retry.
+**Also create new jobs for the cable's rack cohorts** is ticked by default. It creates one job per rack cohort on that cable (C1, C2, C3), named and left unassigned as described under **Re-issuing jobs**, e.g. `RMN2.DHB.05 AA C1 RT1`, with the new cable ID. Each job covers every rack being cleared, including racks whose old result was in spec: that result measured the old cable. No F1 jobs are created, since F1 is on a separate cable. The preview lists the jobs. A rack is left out only if a job scheduled on or after the replacement day holds it and **hasn't tested it yet**, so recording the same replacement twice doesn't make a second set. A job that has already tested the rack (for example a retest job done that morning, before the swap) doesn't count, since that test may have been on the old cable. The jobs are created after the sheet is written. If one fails, the message says so. Click **Replace cable** again with the same time to retry.
 
-For each rack, the app clears `dBm in Port 1` (channel A) or `dBm in Port 2` (channel B), and sets `Timestamp P1`/`P2` to the replacement time. That timestamp *is* the record of the replacement. Every update after that ignores tests on that cable from before it, over any time window, on any computer, and with the command-line script too. These show in **Skipped** as "tested before cable replacement". The first test after the replacement is written as normal. Racks already tested after the replacement time are left alone, and so are racks with a later replacement already recorded. Nothing else in the sheet is touched (OLT, Issue, Fix and the History tabs included). The old values can only be recovered from the sheet's version history.
+The **Cable ID file** gets the new cable ID in place of the old one (a blank one if **New cable ID** was left blank), after the sheet is written. The preview and the confirmation show the old and new IDs. Every change is added to `cable_ids.csv` in the history folder. Jobs created before the replacement keep the old cable's ID in StrataSync.
+
+For each rack, the app clears `dBm in Port 1` (channel A) or `dBm in Port 2` (channel B), and sets `Timestamp P1`/`P2` to the replacement time. That timestamp *is* the record of the replacement. Every update after that ignores tests on that cable from before it, over any time window, on any computer, and with the command-line script too. These show in **Skipped** as "tested before cable replacement". Re-issuing ignores them too: when a completed job's rack has no result in the sheet, the app looks up the rack's tests in StrataSync, and a test from before the replacement doesn't count as a pass, so the rack is re-issued (unless a new-cable job already holds it) instead of being reported as a result the sheet is missing.
+
+The app only knows about a replacement recorded with **Replace cable…**. If a cable is swapped and not recorded, its old in-spec results stay in the sheet and nothing retests those racks. The first test after the replacement is written as normal. Racks already tested after the replacement time are left alone, and so are racks with a later replacement already recorded. Nothing else in the sheet is touched (OLT, Issue, Fix and the History tabs included). The old values can only be recovered from the sheet's version history.
 
 F1 cables are separate and aren't covered by this.
 
@@ -97,6 +119,7 @@ A result's time is the meter's **test time**, which is when the light was measur
 - `settings.json` holds the form values. The client secret and Google key are saved there only while **Remember client secret and Google key on this computer** is ticked. The file is readable only by your user account.
 - `state/` holds the download position. There is one position for each combination of server, client ID and sheet.
 - `history/` holds the update history (see above).
+- `cable_ids.csv` is the default Cable ID file (see **Re-issuing jobs**).
 
 VIAVI typically allows only one valid token per client ID, so avoid running updates on two computers with the same client ID at the same time.
 

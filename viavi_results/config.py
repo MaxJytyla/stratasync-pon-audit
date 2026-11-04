@@ -116,8 +116,18 @@ def make_stratasync_settings(region: str, client_id: str, client_secret: str) ->
     )
 
 
+def default_cable_ids_file() -> Path:
+    return app_data_dir() / "cable_ids.csv"
+
+
+def cable_ids_path(text: str) -> Path:
+    """The Cable ID lookup file: the one entered, or the default in the app's data folder."""
+    text = text.strip().strip('"')
+    return Path(text).expanduser() if text else default_cable_ids_file()
+
+
 def make_reissue_settings(enabled: bool, low_light: bool, rack_dbm: str, f1_dbm: str,
-                          template: str) -> ReissueSettings:
+                          template: str, cable_ids_file: str = "") -> ReissueSettings:
     """Validate the job re-issue options. The thresholds are only checked when used."""
     template = template.strip()
     if enabled and not template:
@@ -131,7 +141,7 @@ def make_reissue_settings(enabled: bool, low_light: bool, rack_dbm: str, f1_dbm:
                 raise ConfigError(f"The {what} low-light level must be a number of dBm, like -11.3.") from None
             values.append(DEFAULT_LOW_LIGHT_RACK_DBM if what == "rack-level" else DEFAULT_LOW_LIGHT_F1_DBM)
     return ReissueSettings(enabled=enabled, low_light=low_light, rack_dbm=values[0], f1_dbm=values[1],
-                           template=template)
+                           template=template, cable_ids_file=cable_ids_file.strip())
 
 
 # ---- remembered form values -------------------------------------------------------
@@ -157,12 +167,13 @@ class SavedForm:
     low_light_rack_dbm: str = str(DEFAULT_LOW_LIGHT_RACK_DBM)
     low_light_f1_dbm: str = str(DEFAULT_LOW_LIGHT_F1_DBM)
     job_template: str = DEFAULT_TEMPLATE
+    cable_ids_file: str = ""  # "" = cable_ids.csv in the app's data folder
     # Bumped when a default changes in a way saved settings shouldn't keep; see load().
     version: int = SETTINGS_VERSION
 
     def reissue_settings(self) -> ReissueSettings:
         return make_reissue_settings(self.reissue_enabled, self.reissue_low_light, self.low_light_rack_dbm,
-                                     self.low_light_f1_dbm, self.job_template)
+                                     self.low_light_f1_dbm, self.job_template, self.cable_ids_file)
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "SavedForm":

@@ -16,3 +16,8 @@ flagged*.csv
 # OS clutter
 .DS_Store
 Thumbs.db
+
+# Cable serials are sensitive: the Cable ID file and cable registers stay out of the repo
+cable_ids*.csv
+*Cable Register*.xlsx
+*Cable Register*.csv

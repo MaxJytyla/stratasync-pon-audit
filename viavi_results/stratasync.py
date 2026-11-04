@@ -32,6 +32,12 @@ TOKEN_PATH = "/oauth/token"
 SEARCH_PATH = "/api/v1/testresults/search"
 JOB_SEARCH_PATH = "/api/v3/workflow/search"
 JOB_CREATE_PATH = "/api/v3/workflow/workorder"
+JOB_PATH = "/api/v3/workflow/{workflow_id}"
+
+# A job's Cable ID attribute as the RMN templates define it, for a job that
+# doesn't have one yet.
+CABLE_ID_ATTRIBUTE = {"orderIndex": 0, "label": "Cable ID", "valueType": "string", "editable": "true",
+                      "visible": True}
 
 # Values for DateRange.dateFilter (guide p.22).
 TODAY = -1
@@ -193,12 +199,17 @@ class StrataSyncClient:
 
     def _post_json(self, path: str, payload: Dict[str, Any],
                    session: Optional[requests.Session] = None) -> Dict[str, Any]:
+        return self._send_json("POST", path, payload, session)
+
+    def _send_json(self, method: str, path: str, payload: Dict[str, Any],
+                   session: Optional[requests.Session] = None) -> Dict[str, Any]:
         url = self._settings.base_url + path
         token = None
         for attempt in (1, 2):
             token = self._bearer(force_refresh=attempt == 2, rejected=token)
             # A 401 means nothing was done, so even a change can be resent after it.
-            resp = (session or self._session).post(
+            resp = (session or self._session).request(
+                method,
                 url,
                 json=payload,
                 headers={
@@ -436,6 +447,35 @@ class StrataSyncClient:
             raise StrataSyncError(f"Job creation failed: {body.get('message') or body}",
                                   status=body.get("httpStatus"), body=body)
         return (body.get("result") or {}).get("cdm") or {}
+
+
+    def set_cable_id(self, job: Dict[str, Any], cable_id: str) -> Dict[str, Any]:
+        """Set the Cable ID of a job that isn't approved (e.g. one just created).
+
+        `job` is the job as StrataSync returned it. Only the job's Job Manager
+        attributes are sent, all of them with the Cable ID changed: the
+        PATCH may only change techInfo, date, dueDate and those attributes,
+        and changing the technician would reset the job and detach its
+        results. Sent once, never retried. Returns the updated job.
+        """
+        workflow = job.get("workflow") or {}
+        workflow_id = workflow.get("workflowId")
+        if not workflow_id:
+            raise StrataSyncError("The job has no workflowId, so its Cable ID can't be set")
+        attributes = {k: dict(v) for k, v in (workflow.get("jobManagerAttributes") or {}).items()
+                      if isinstance(v, dict)}
+        attributes.setdefault("cableId", dict(CABLE_ID_ATTRIBUTE))["value"] = cable_id
+        body = self._send_json("PATCH", JOB_PATH.format(workflow_id=int(workflow_id)),
+                               {"cdmVersion": "2.2", "cdm": {"workflow": {"jobManagerAttributes": attributes}}},
+                               session=self._write_session)
+        if body.get("type") != "success":
+            raise StrataSyncError(f"Setting the Cable ID failed: {body.get('message') or body}",
+                                  status=body.get("httpStatus"), body=body)
+        updated = (body.get("result") or {}).get("cdm") or {}
+        got = (((updated.get("workflow") or {}).get("jobManagerAttributes") or {}).get("cableId") or {}).get("value")
+        if updated and (got or "") != cable_id:
+            raise StrataSyncError(f"StrataSync answered with Cable ID {got!r} instead of {cable_id!r}")
+        return updated
 
 
 def _days(start: date, end: date) -> Iterable[date]:

@@ -31,6 +31,12 @@ Jobs are named after the cohort's own job with " RT<n>" added, n counting up
 from the highest RT number that cohort already has ("RMN2.DHA.12 AA C2 RT3").
 A replaced cable gets new jobs for its rack cohorts, named the same way.
 
+Each new job gets its cable's Cable ID from the lookup file (cable_ids.py):
+the base serial of the row and channel's multi-drop cable for rack cohorts,
+"N/A (Trunk Fiber)" for F1. A cable with no ID on file gets a blank one. The
+Cable ID is set right after the job is created; if that fails, the job stays
+(it's logged so the ID can be filled in by hand).
+
 New jobs are made from the job template (RMN-BB-PON-Test by default), assigned
 to no technician: they wait in StrataSync, in the STARTED state, until someone
 assigns them. Each goes into the same StrataSync organization as the job it
@@ -56,8 +62,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from .cable_ids import CableIds
 from .pon_audit import (
     SITE,
     CellUpdate,
@@ -91,6 +98,8 @@ JOBS_SINCE = datetime(2026, 8, 1, tzinfo=timezone.utc)
 # Finished jobs changed within this long are checked on every update.
 JOB_LOOKBACK = timedelta(days=14)
 FINISHED_STATES = frozenset({"COMPLETED", "APPROVED"})
+# A test location in one of these states has a result in its job.
+TESTED_LOCATION_STATES = frozenset({"COMPLETED", "APPROVED"})
 
 # jobManagement.createdBy of jobs made through the Jobs API.
 API_CREATORS = frozenset({"ssWoApi", "ssWfApi"})
@@ -106,6 +115,7 @@ class ReissueSettings:
     rack_dbm: float = DEFAULT_LOW_LIGHT_RACK_DBM
     f1_dbm: float = DEFAULT_LOW_LIGHT_F1_DBM
     template: str = DEFAULT_TEMPLATE
+    cable_ids_file: str = ""  # the Cable ID lookup file (see cable_ids.py); "" = the default one
 
     def threshold(self, loc: Location) -> float:
         return self.f1_dbm if isinstance(loc, F1Location) else self.rack_dbm
@@ -123,6 +133,9 @@ class Retest:
     since: Optional[date] = None
     own_job: Optional[str] = None
     location_id: Optional[int] = None  # the location's workflowId in `own_job`, to look up its tests
+    # Only a job that hasn't tested this location yet shows it's been re-issued
+    # (a replaced cable: a test made before the replacement doesn't count).
+    untested_only: bool = False
 
 
 @dataclass
@@ -134,6 +147,8 @@ class PlannedJob:
     org_id: Optional[int] = None  # the StrataSync organization to create it in
     workflow_id: Optional[int] = None  # set once created
     error: str = ""  # set if creating it failed
+    cable_id: str = ""  # the Cable ID to give it; "" leaves it blank
+    cable_id_error: str = ""  # set if the job was created but its Cable ID couldn't be set
     skipped: str = ""  # set if every location was re-issued by someone else first
 
     @property
@@ -208,6 +223,7 @@ class ExistingJob:
     total: int = 0
     org_id: Optional[int] = None
     created_by: str = ""  # jobManagement.createdBy: "ssJobMgr" (web Job Manager), "ssWoApi" (this app), ...
+    tested_locations: FrozenSet[Location] = frozenset()  # locations with a result in this job
 
     @property
     def finished(self) -> bool:
@@ -223,19 +239,21 @@ def existing_jobs(jobs: Iterable[Mapping[str, Any]]) -> List[ExistingJob]:
     for job in jobs:
         wf = job.get("workflow") or {}
         scheduled_at = _parse_dt(wf.get("date"))
-        located = []
+        located, tested = [], set()
         for test in job.get("tests") or []:
             for loc in test.get("testLocations") or []:
                 parsed = parse_location(loc.get("label") or "")
                 if parsed:
                     located.append((parsed, loc.get("workflowId")))
+                    if str(loc.get("state") or "").upper() in TESTED_LOCATION_STATES:
+                        tested.add(parsed)
         stats = job.get("testStats") or {}
         out.append(ExistingJob(
             str(wf.get("workOrderId") or ""), scheduled_at.date() if scheduled_at else None,
             tuple(loc for loc, _ in located), str(job.get("state") or ""), scheduled_at,
             _parse_dt(job.get("jobModifiedOn")), tuple(located),
             int(stats.get("tested") or 0), int(stats.get("totalCnt") or 0), job.get("orgId"),
-            str((wf.get("jobManagement") or {}).get("createdBy") or "")))
+            str((wf.get("jobManagement") or {}).get("createdBy") or ""), frozenset(tested)))
     return out
 
 
@@ -359,7 +377,7 @@ Confirm = Callable[[List[Retest]], Dict[str, Optional[str]]]
 
 def plan_reissue(retests: Sequence[Retest], jobs: Sequence[ExistingJob], indexes: Mapping[str, TabIndex],
                  settings: ReissueSettings, *, now: datetime, until: datetime,
-                 confirm: Optional[Confirm] = None) -> ReissuePlan:
+                 confirm: Optional[Confirm] = None, cable_ids: Optional[CableIds] = None) -> ReissuePlan:
     """The jobs to re-issue in this update.
 
     `retests` are this update's flagged and low-light results (find_retests),
@@ -368,7 +386,8 @@ def plan_reissue(retests: Sequence[Retest], jobs: Sequence[ExistingJob], indexes
     not after `until`, the end of this update's search, whose results the
     sheet may not have yet), or if one of `retests` was tested in it.
     `confirm` checks StrataSync for locations the sheet has no passing result
-    for; without it, the sheet alone decides.
+    for; without it, the sheet alone decides. Each job gets its cohort's
+    Cable ID from `cable_ids` (blank without it, or if the file has none).
     """
     plan = ReissuePlan()
     groups: Dict[str, Tuple[str, List[Retest]]] = {}
@@ -444,17 +463,24 @@ def plan_reissue(retests: Sequence[Retest], jobs: Sequence[ExistingJob], indexes
             plan.waiting.append((retest, f"{job.work_order_id} ({job.progress()})"))
         else:
             plan.not_reissued.append((retest, f"{job.work_order_id} doesn't list this location"))
-    _add_jobs(plan, groups, jobs)
+    _add_jobs(plan, groups, jobs, lambda members: _lookup_cable_id(members, cable_ids))
     return plan
 
 
 def _add_jobs(plan: ReissuePlan, groups: Mapping[str, Tuple[str, List[Retest]]],
-              jobs: Sequence[ExistingJob]) -> None:
+              jobs: Sequence[ExistingJob], cable_id: Callable[[List[Retest]], str]) -> None:
     plan.taken = {j.work_order_id.upper() for j in jobs}
     for base, (cohort, members) in sorted(groups.items()):
         members.sort(key=lambda r: r.label)
         plan.jobs.append(PlannedJob(next_work_order_id(base, plan.taken), cohort, base, members,
-                                    org_id=_organization(members, jobs)))
+                                    org_id=_organization(members, jobs), cable_id=cable_id(members)))
+
+
+def _lookup_cable_id(members: Sequence[Retest], cable_ids: Optional[CableIds]) -> str:
+    """A cohort job's Cable ID: its cable's, from the lookup file (every member
+    of a cohort is on the same cable)."""
+    loc = parse_location(members[0].label) if members else None
+    return cable_ids.for_location(loc) if cable_ids and loc else ""
 
 
 def _organization(members: Sequence[Retest], jobs: Sequence[ExistingJob]) -> Optional[int]:
@@ -489,21 +515,28 @@ def _covering_job(loc: Location, retest: Retest, jobs: Sequence[ExistingJob]) ->
     own = (retest.own_job or "").strip().upper()
     for job in jobs:
         if (job.scheduled and job.scheduled >= retest.since and job.work_order_id.strip().upper() != own
-                and loc in job.locations):
+                and loc in job.locations
+                and not (retest.untested_only and loc in job.tested_locations)):
             return f"{job.work_order_id} (scheduled {job.scheduled})"
     return ""
 
 
 def plan_cable_jobs(data_hall: str, row: int, channel: str, racks: Iterable[int], replaced_at: str,
-                    jobs: Sequence[ExistingJob]) -> ReissuePlan:
+                    jobs: Sequence[ExistingJob], cable_id: str = "") -> ReissuePlan:
     """New jobs for every rack cohort on a replaced cable (F1 isn't on it).
 
-    A rack already in a job scheduled on or after the replacement day is left
-    out, so recording the same replacement twice doesn't make two sets of jobs.
+    Every job gets `cable_id`, the new cable's ID ("" leaves it blank).
+
+    A rack is left out only if a job scheduled on or after the replacement day
+    holds it and hasn't tested it yet, so recording the same replacement twice
+    doesn't make two sets of jobs. A job that has already tested the rack
+    doesn't count: that day's test may have been made on the old cable (the
+    sheet's record of the rack is cleared regardless, see racks), and leaving
+    the rack out would leave the new cable untested there.
     """
     replaced_day = datetime.fromisoformat(replaced_at).date()
     retests = [Retest(standard_label(RackLocation(data_hall, row, rack, channel)), f"cable replaced at {replaced_at}",
-                      since=replaced_day)
+                      since=replaced_day, untested_only=True)
                for rack in sorted(racks)]
     plan = ReissuePlan()
     groups: Dict[str, Tuple[str, List[Retest]]] = {}
@@ -518,7 +551,7 @@ def plan_cable_jobs(data_hall: str, row: int, channel: str, racks: Iterable[int]
             plan.already_reissued.append((retest, covering))
             continue
         groups.setdefault(job_base(loc, cohort), (_cohort_text(loc, cohort), []))[1].append(retest)
-    _add_jobs(plan, groups, jobs)
+    _add_jobs(plan, groups, jobs, lambda members: cable_id.strip())
     return plan
 
 
@@ -577,7 +610,25 @@ def create_jobs(client, plan: ReissuePlan, template: str, log: Log) -> None:
             if job.org_id and landed and int(landed) != int(job.org_id):
                 log(f"Warning: {job.work_order_id} was meant for organization {job.org_id} but StrataSync put it "
                     f"in {landed}; move it in StrataSync")
+            _set_cable_id(client, job, created, log)
             break
+
+
+def _set_cable_id(client, job: PlannedJob, created: Mapping[str, Any], log: Log) -> None:
+    """Give a just-created job its Cable ID. A failure doesn't undo the job (it
+    exists and covers its locations); it's recorded on the job and logged so
+    the Cable ID can be filled in by hand."""
+    if not job.cable_id:
+        log(f"{job.work_order_id}: no Cable ID on file for this cable, so it's left blank")
+        return
+    try:
+        client.set_cable_id(dict(created), job.cable_id)
+    except Exception as exc:  # recorded on the job and reported
+        job.cable_id_error = str(exc)
+        log(f"Warning: created {job.work_order_id} but couldn't set its Cable ID to {job.cable_id!r}: {exc}. "
+            "Set it by hand in StrataSync.")
+        return
+    log(f"{job.work_order_id}: Cable ID set to {job.cable_id}")
 
 
 def _drop_reissued(job: PlannedJob, plan: ReissuePlan, recent: Sequence[ExistingJob], log: Log) -> bool:

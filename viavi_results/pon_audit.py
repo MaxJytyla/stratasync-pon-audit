@@ -626,6 +626,20 @@ def _is_blank(value: Any) -> bool:
     return value is None or str(value).strip() == ""
 
 
+def replacement_time(loc: "Location", indexes: Mapping[str, "TabIndex"]) -> Optional[datetime]:
+    """When the cable feeding `loc` was replaced, if the sheet records it: a
+    blank dBm with a timestamp (see above). None otherwise. Every test of the
+    location from before this time was made on the old cable and doesn't count."""
+    index = indexes.get(loc.tab)
+    row = index.rows.get(loc.key) if index else None
+    if row is None or not _is_blank(index.get(row, index.column(loc.columns.power))):
+        return None
+    stamp = _parse_time(index.get(row, index.column(loc.columns.timestamp)))
+    if stamp is not None and stamp.tzinfo is None:
+        stamp = stamp.astimezone()
+    return stamp
+
+
 @dataclass(frozen=True)
 class RackClearing:
     rack: int

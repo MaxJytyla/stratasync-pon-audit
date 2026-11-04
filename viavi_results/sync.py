@@ -33,8 +33,10 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional, Tuple
 
+from . import cable_ids as cable_id_file
 from . import history
-from .config import ConfigError, Settings, StrataSyncSettings, app_data_dir
+from .cable_ids import CableIdFileError, cable_name
+from .config import ConfigError, Settings, StrataSyncSettings, app_data_dir, cable_ids_path
 from .reissue import (
     JOB_LOOKBACK,
     JOBS_SINCE,
@@ -62,6 +64,7 @@ from .pon_audit import (
     reading_from_search,
     reading_problems,
     readings_from_result,
+    replacement_time,
 )
 from .sheets import SheetAccessError, SheetWriter
 from .stratasync import SYNC_TIME, StrataSyncClient, StrataSyncError
@@ -291,6 +294,17 @@ def _plan_reissue(client: StrataSyncClient, result: SyncResult, indexes, reissue
         result.reissue_error = "some results couldn't be downloaded; the next update checks the jobs again"
         log(f"Re-issue: skipped, because {result.reissue_error}")
         return ReissuePlan()
+    try:
+        lookup = cable_id_file.load(cable_ids_path(reissue.cable_ids_file))
+    except CableIdFileError as exc:
+        # Stop rather than create jobs with blank Cable IDs; the next update tries again.
+        result.reissue_error = f"{exc}. Fix the file; jobs are re-issued once it can be read"
+        log(f"Re-issue: {result.reissue_error}")
+        return ReissuePlan()
+    log(f"Re-issue: Cable IDs from {lookup.path} ({lookup.describe()})"
+        if lookup.path and lookup.path.exists() else
+        f"Re-issue: no Cable ID file at {lookup.path}, so new jobs get a blank Cable ID (F1 jobs: "
+        f"{cable_id_file.F1_CABLE_ID})")
     retests = find_retests(result.plan, reissue)
     apply_updates(indexes, result.plan.updates)  # judge finished jobs by the sheet after this update
     log(f"Re-issue: checking jobs finished in the last {JOB_LOOKBACK.days} days"
@@ -298,7 +312,8 @@ def _plan_reissue(client: StrataSyncClient, result: SyncResult, indexes, reissue
     try:
         jobs = existing_jobs(client.search_jobs(JOBS_SINCE, datetime.now(timezone.utc) + timedelta(days=35)))
         plan = plan_reissue(retests, jobs, indexes, reissue, now=datetime.now(timezone.utc), until=result.end,
-                            confirm=lambda found: _confirm(client, found, indexes, reissue, log))
+                            confirm=lambda found: _confirm(client, found, indexes, reissue, log),
+                            cable_ids=lookup)
     except (StrataSyncError, ValueError) as exc:
         result.reissue_error = error_text(exc)
         log(f"Re-issue: could not plan jobs: {result.reissue_error}")
@@ -329,6 +344,11 @@ def _confirm(client: StrataSyncClient, retests: List, indexes, reissue: ReissueS
     isn't weaker than the threshold. Otherwise the reason is what was wrong
     with its latest test. A lookup that fails counts as "needs a retest" with
     the sheet's reason, so nothing is silently dropped.
+
+    Tests from before a cable replacement recorded in the sheet don't count:
+    they measured the old cable. Without this, an in-spec test of the old
+    cable would look like a result the sheet is merely missing, and the
+    location would never be retested on the new cable.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -344,6 +364,12 @@ def _confirm(client: StrataSyncClient, retests: List, indexes, reissue: ReissueS
         if not readings:
             return f"{retest.label}: not tested in {retest.own_job}"
         loc = readings[-1].location
+        replaced = replacement_time(loc, indexes) if loc else None
+        if replaced is not None:
+            readings = [rd for rd in readings if _tested_after(rd, replaced)]
+            if not readings:
+                return (f"{retest.label}: its tests in {retest.own_job} were made before the cable was replaced "
+                        f"({replaced.isoformat(timespec='minutes')})")
         index = indexes.get(loc.tab) if loc else None
         row = index.rows.get(loc.key) if index else None
         expected = index.get(row, index.column(loc.columns.expected_olt)) if row else None
@@ -361,6 +387,13 @@ def _confirm(client: StrataSyncClient, retests: List, indexes, reissue: ReissueS
         return dict(zip((r.label for r in retests), pool.map(check, retests)))
 
 
+def _tested_after(reading, when: datetime) -> bool:
+    try:
+        return reading.timestamp > when
+    except ValueError:  # no usable test time: can't show it's from the new cable
+        return False
+
+
 def replace_cable(
     settings: Settings,
     data_hall: str,
@@ -372,7 +405,9 @@ def replace_cable(
     log: Log = print,
     jobs_for: Optional[StrataSyncSettings] = None,
     template: str = "",
-) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan]]:
+    new_cable_id: Optional[str] = None,
+    cable_ids_file: str = "",
+) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan], Optional["CableIdChange"]]:
     """Plan (and if `apply`, write) the clearing of one cable's results.
 
     With `jobs_for` (the StrataSync account), also plans (and if `apply`,
@@ -380,20 +415,38 @@ def replace_cable(
     covering the racks that are cleared. They're created after the sheet is
     written; any that fail are reported on the returned plan.
 
-    Returns (sheet title, CableReplacementPlan, jobs plan or None). The sheet
-    is read afresh each time, so applying never relies on an earlier preview's values.
+    With `new_cable_id` (the new cable's ID; "" if not known yet), the Cable
+    ID lookup file gets it in place of the old cable's, after the sheet is
+    written, and the new jobs get it.
+
+    Returns (sheet title, CableReplacementPlan, jobs plan or None, Cable ID
+    change or None). The sheet is read afresh each time, so applying never
+    relies on an earlier preview's values.
     """
     if replaced_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise ConfigError("The replacement time is in the future. Every test before it would be "
                           "ignored, including tests of the new cable.")
     with run_lock():
         return _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log,
-                              jobs_for=jobs_for, template=template)
+                              jobs_for=jobs_for, template=template, new_cable_id=new_cable_id,
+                              cable_ids_file=cable_ids_file)
+
+
+@dataclass
+class CableIdChange:
+    """The lookup file's entry for a replaced cable, before and after."""
+
+    cable: str  # e.g. "RMN2.DHB.05 AA"
+    old: str
+    new: str
+    file: Path
+    error: str = ""  # set if the file couldn't be updated
 
 
 def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, replaced_at: datetime,
                    *, apply: bool, log: Log, jobs_for: Optional[StrataSyncSettings], template: str,
-                   ) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan]]:
+                   new_cable_id: Optional[str], cable_ids_file: str,
+                   ) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan], Optional[CableIdChange]]:
     writer = SheetWriter(settings)
     tab = rack_tab(data_hall)
     values = writer.read_tabs([tab]).get(tab)
@@ -402,21 +455,40 @@ def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, r
     plan = plan_cable_replacement(TabIndex.build(tab, values, RACK_KEY_HEADERS),
                                   data_hall, row, channel, replaced_at)
     cleared = sum(r.cleared for r in plan.racks)
+    change = lookup = None
+    if new_cable_id is not None:
+        key = (data_hall, row, channel)
+        try:
+            lookup = cable_id_file.load(cable_ids_path(cable_ids_file))
+        except CableIdFileError as exc:
+            raise ConfigError(f"{exc}. Fix the file before recording the replacement, so the new "
+                              "cable's ID can be saved in it.") from None
+        change = CableIdChange(cable_name(key), lookup.get(key), new_cable_id.strip(), lookup.path)
     jobs_plan = client = None
     if jobs_for:
         client = StrataSyncClient(jobs_for)
         jobs = existing_jobs(client.search_jobs(JOBS_SINCE, datetime.now(timezone.utc) + timedelta(days=35)))
         jobs_plan = plan_cable_jobs(data_hall, row, channel, [r.rack for r in plan.racks if r.cleared],
-                                    plan.replaced_at, jobs)
+                                    plan.replaced_at, jobs, cable_id=change.new if change else "")
     if not apply:
-        return writer.spreadsheet.title, plan, jobs_plan
+        return writer.spreadsheet.title, plan, jobs_plan, change
     n = writer.write_cells(plan.updates)
     log(f"Cable replaced: {plan.cable} at {plan.replaced_at}. Cleared {cleared} rack(s) "
         f"({n} cells) in '{tab}'" + (f", left {len(plan.racks) - cleared} alone" if cleared < len(plan.racks) else ""))
+    if change is not None:
+        try:
+            lookup.set((data_hall, row, channel), change.new)
+            log(f"Cable ID of {change.cable} in {change.file.name}: {change.old or '(blank)'} -> "
+                f"{change.new or '(blank)'}")
+        except OSError as exc:
+            change.error = f"couldn't save {change.file}: {exc}"
+            log(f"Warning: the Cable ID file wasn't updated: {change.error}. Enter {change.cable} = "
+                f"{change.new or '(blank)'} in it by hand.")
+        history.record_cable_id(change, plan.replaced_at, writer.spreadsheet.title, log)
     if jobs_plan and jobs_plan.jobs:
         create_jobs(client, jobs_plan, template, log)
         history.record_jobs(jobs_plan, history.CABLE, writer.spreadsheet.title, log)
-    return writer.spreadsheet.title, plan, jobs_plan
+    return writer.spreadsheet.title, plan, jobs_plan, change
 
 
 FLAG_CSV_HEADER = history.FLAG_FIELDS
