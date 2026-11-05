@@ -48,7 +48,8 @@ Every update that writes to the sheet is recorded, whether it was started from t
 | `flagged.csv` | flagged result (not written to the sheet): problem, location, details, test time, tech, serial, StrataSync source |
 | `written.csv` | result written: location, tab, cells, dBm, test time, tech, serial, source |
 | `jobs.csv` | job re-issued, or that failed to be, by an update or a cable replacement: name, status, workflowId, cohort, locations, why, error, Cable ID, and why the Cable ID couldn't be set (files from before Cable IDs get the new header as a row before the first longer row) |
-| `cable_ids.csv` | change a cable replacement made to the Cable ID file: cable, replacement time, old and new Cable ID |
+| `cable_ids.csv` | change to the Cable ID file, by a cable replacement or **Change cable ID…**: cable, replacement time (blank for a Cable ID change), old and new Cable ID, which of the two it was (`replacement` or `correction`; older rows have none and are replacements), and what happened to the jobs |
+| `cable_id_jobs.csv` | job whose Cable ID **Change cable ID…** set, or tried to: job, scheduled date, state, old and new Cable ID, outcome (`changed`, `failed`, `skipped`), error |
 | `automatic.log` | progress message from an automatic update (it starts over at 5 MB, keeping one old copy as `automatic.log.1`) |
 
 The **History** tab lists the latest updates, and the **Automatic updates** section shows the outcome of the last automatic one. If a CSV is open in Excel when an update runs, Windows won't let the app add to it, so that update's rows go to a dated file next to it (e.g. `flagged-20261030-140000.csv`).
@@ -83,9 +84,35 @@ RMN2.DHB.12 BB,
 - A blank Cable ID is fine (a cable whose serial isn't known yet). Fill it in later; jobs created after that get it.
 - If the file can't be read (a cable listed twice, a line that isn't a cable), updates still write the sheet but don't re-issue jobs until it's fixed, so no jobs are created with blank Cable IDs by mistake.
 - A cable replacement writes the new cable's ID over the old one (see below).
+- To enter a Cable ID that's missing, or fix a typo, use **Change cable ID…** (see below). It changes the file and the cable's jobs together. Editing the file by hand only affects jobs created after that.
 - Each computer has its own file unless you point **Cable ID file** at a shared one (e.g. on a shared drive). A replacement recorded on one computer only updates the file that computer uses.
 
 Re-issuing uses the same client ID and secret as the test results. They need access to the StrataSync TPA Jobs API, and the service user needs permission to create jobs.
+
+### Changing a cable's ID (missing or mistyped)
+
+**Change cable ID…** is for a Cable ID that was never entered, or was entered wrong. It's not for a replaced cable: that's a new cable, so use **Replace cable…**, which leaves the old cable's jobs with the old ID.
+
+1. Choose the data hall, row and channel. The line beside them shows the cable's Cable ID in the Cable ID file now (or that it isn't in the file yet; it's then added).
+2. Enter the **New cable ID** and click **Preview**. The cable's jobs in StrataSync are listed (every rack job of that row and channel, C1, C2 and C3 alike, including RT jobs; not F1, which is on trunk fiber), with their current Cable ID. Nothing is changed yet.
+3. Tick the jobs to change (click a row), and click **Change cable ID**, then confirm.
+
+Which jobs are ticked to begin with:
+
+- **Ticked:** jobs with a blank Cable ID, or the one the file has now (the typo being fixed; capitals don't matter).
+- **Not ticked, but you can tick them:** jobs with some other Cable ID (perhaps a different typo typed by hand, perhaps another cable's), and jobs scheduled before the cable's latest replacement. Those tested the old cable, so they keep its ID. The replacement time comes from this computer's history (`cable_ids.csv`) and from the sheet (a rack on the cable with a blank dBm and a timestamp), whichever is later. A replacement recorded on another computer, whose racks have all been retested since, isn't known here: check the jobs' dates against it yourself. Jobs scheduled on the replacement day itself count as new-cable jobs.
+- **Can't be ticked:** jobs that already have the new ID, jobs that also hold locations on other cables (change those by hand), and approved jobs unless **Also change approved jobs** is ticked. Jobs at other sites (RMN1) are never listed.
+
+Approved jobs are locked in StrataSync. With **Also change approved jobs** ticked, each one is unapproved, given the new ID and approved again, as `job_manager`'s step-by-step does (unapproving uses an undocumented StrataSync endpoint). It's approved again even if setting the ID failed. If approving it again fails, the message says so: approve it in StrataSync.
+
+How it's done, and what's checked:
+
+- Only the job's Cable ID is sent (the same change new jobs get), never its technician, which would reset the job. After each job, its state, technician, dates and results are compared with before; at the first one where anything else changed, it stops and says which. At the end, every changed job is looked up again to check its Cable ID.
+- Everything is looked up again when you click **Change cable ID**. If the file's Cable ID for the cable changed since the preview, nothing is changed (preview again). A ticked job whose Cable ID changed since is skipped.
+- The jobs are changed first, then the file, so jobs re-issued in the meantime don't get a mix. The file is changed even if some jobs failed, since the new ID is the right one. It runs as an update does: not at the same time as an update or cable replacement on this computer.
+- The preview warns if the new ID doesn't look like the site's others (S7 + 8 characters + 031), or if another cable in the file already has it.
+- **To retry** jobs that failed or were skipped, do it again with the same ID. The file already has it, so only jobs change, and jobs still holding the ID it replaced (from this computer's history) are ticked.
+- Each change goes into `cable_ids.csv` and each job into `cable_id_jobs.csv` in the history folder, and the Log lists every step.
 
 ### Replacing a multi-drop cable
 

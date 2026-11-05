@@ -7,7 +7,8 @@ Each update (from the window or an automatic one) appends to CSV files in
   flagged.csv   every flagged result, which was *not* written to the sheet
   written.csv   every result written: location, tab, cells, dBm, test time
   jobs.csv      every job re-issued (or that failed to be): name, locations, why, Cable ID
-  cable_ids.csv every change a cable replacement made to the Cable ID lookup file
+  cable_ids.csv every change to the Cable ID lookup file, by a cable replacement or a Cable ID change
+  cable_id_jobs.csv every StrataSync job whose Cable ID a Cable ID change set (or failed to)
 
 Automatic updates also append their progress messages to automatic.log.
 Nothing here is ever rewritten or pruned, so the files are an audit trail.
@@ -32,6 +33,9 @@ Log = Callable[[str], None]
 MANUAL = "manual"
 AUTOMATIC = "automatic"
 CABLE = "cable replacement"
+# cable_ids.csv's "change" column. Rows from before it had none: all were replacements.
+REPLACEMENT = "replacement"
+CORRECTION = "correction"
 
 RUNS_HEADER = ["run_at", "trigger", "status", "sheet", "searched_from", "searched_to", "found", "truepon",
                "new", "written", "flagged", "skipped", "cells_written", "download_failures",
@@ -43,7 +47,10 @@ WRITTEN_HEADER = ["run_at", "trigger", "sheet", "label", "tab", "cells", "dbm", 
 
 JOBS_HEADER = ["run_at", "trigger", "sheet", "work_order_id", "status", "workflow_id", "cohort", "locations",
                "reasons", "error", "cable_id", "cable_id_error"]
-CABLE_IDS_HEADER = ["run_at", "sheet", "cable", "replaced_at", "old_cable_id", "new_cable_id", "file", "error"]
+CABLE_IDS_HEADER = ["run_at", "sheet", "cable", "replaced_at", "old_cable_id", "new_cable_id", "file", "error",
+                    "change", "jobs"]
+CABLE_ID_JOBS_HEADER = ["run_at", "cable", "workflow_id", "work_order_id", "scheduled", "state", "old_cable_id",
+                        "new_cable_id", "outcome", "error"]
 
 LOG_MAX_BYTES = 5_000_000
 
@@ -144,13 +151,45 @@ def record_jobs(plan: "ReissuePlan", trigger: str, sheet: str, log: Log = print,
         log(f"Could not save the job history: {exc}")
 
 
-def record_cable_id(change, replaced_at: str, sheet: str, log: Log = print) -> None:
-    """Append a cable replacement's change to the Cable ID lookup file to cable_ids.csv."""
+def record_cable_id(change, replaced_at: str, sheet: str, log: Log = print, kind: str = REPLACEMENT,
+                    jobs: str = "") -> None:
+    """Append a change to the Cable ID lookup file to cable_ids.csv: a cable
+    replacement's (`replaced_at` set) or a Cable ID change's (kind CORRECTION)."""
     try:
         _append("cable_ids.csv", CABLE_IDS_HEADER, [[
-            _now(), sheet, change.cable, replaced_at, change.old, change.new, str(change.file), change.error]], log)
+            _now(), sheet, change.cable, replaced_at, change.old, change.new, str(change.file), change.error,
+            kind, jobs]], log)
     except OSError as exc:
         log(f"Could not save the Cable ID history: {exc}")
+
+
+def record_cable_id_jobs(cable: str, jobs: Iterable, new: str, log: Log = print) -> None:
+    """Append the jobs a Cable ID change set the Cable ID of (or tried to) to cable_id_jobs.csv."""
+    run_at = _now()
+    try:
+        _append("cable_id_jobs.csv", CABLE_ID_JOBS_HEADER, [
+            [run_at, cable, j.workflow_id, j.work_order_id, j.scheduled or "", j.state, j.current, new,
+             j.outcome, j.error] for j in jobs], log)
+    except OSError as exc:
+        log(f"Could not save the Cable ID job history: {exc}")
+
+
+def cable_id_history() -> List[Dict[str, str]]:
+    """Every row of cable_ids.csv, oldest first, as dicts. Rows written before a
+    column existed lack it ("change" is then a replacement). Files changed
+    header over time (see _write), so each row is read with the header above it."""
+    rows: List[Dict[str, str]] = []
+    try:
+        with (history_dir() / "cable_ids.csv").open(newline="", encoding="utf-8-sig") as fh:
+            header: List[str] = []
+            for row in csv.reader(fh):
+                if row and row[0] == CABLE_IDS_HEADER[0]:
+                    header = row
+                elif row and header:
+                    rows.append(dict(zip(header, row)))
+    except OSError:
+        return []
+    return rows
 
 
 def record_status(trigger: str, status: str, sheet: str, message: str, log: Log = print) -> None:

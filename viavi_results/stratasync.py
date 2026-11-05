@@ -33,6 +33,10 @@ SEARCH_PATH = "/api/v1/testresults/search"
 JOB_SEARCH_PATH = "/api/v3/workflow/search"
 JOB_CREATE_PATH = "/api/v3/workflow/workorder"
 JOB_PATH = "/api/v3/workflow/{workflow_id}"
+# The web UI's internal endpoint for unapproving a job (APPROVED back to
+# COMPLETED). Not documented; the public API can only approve. The TPA token
+# was accepted for it (job_manager, checked 2026-11-03).
+JOB_UNAPPROVE_PATH = "/api/internal/v1/workflow/{workflow_id}/unapprove"
 
 # A job's Cable ID attribute as the RMN templates define it, for a job that
 # doesn't have one yet.
@@ -197,12 +201,14 @@ class StrataSyncClient:
             )
         return list(body.get("result") or [])
 
-    def _post_json(self, path: str, payload: Dict[str, Any],
-                   session: Optional[requests.Session] = None) -> Dict[str, Any]:
-        return self._send_json("POST", path, payload, session)
+    def _post_json(self, path: str, payload: Optional[Dict[str, Any]],
+                   session: Optional[requests.Session] = None,
+                   params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        return self._send_json("POST", path, payload, session, params)
 
-    def _send_json(self, method: str, path: str, payload: Dict[str, Any],
-                   session: Optional[requests.Session] = None) -> Dict[str, Any]:
+    def _send_json(self, method: str, path: str, payload: Optional[Dict[str, Any]],
+                   session: Optional[requests.Session] = None,
+                   params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         url = self._settings.base_url + path
         token = None
         for attempt in (1, 2):
@@ -212,6 +218,7 @@ class StrataSyncClient:
                 method,
                 url,
                 json=payload,
+                params=params,
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/json",
@@ -476,6 +483,28 @@ class StrataSyncClient:
         if updated and (got or "") != cable_id:
             raise StrataSyncError(f"StrataSync answered with Cable ID {got!r} instead of {cable_id!r}")
         return updated
+
+    def approve_job(self, workflow_id: int) -> Dict[str, Any]:
+        """Approve a COMPLETED (or INPROGRESS) job by its workflowId. Approved jobs
+        are locked: they can't be modified until they're unapproved. Sent once,
+        never retried. Returns the updated job."""
+        body = self._post_json(JOB_PATH.format(workflow_id=int(workflow_id)), None,
+                               session=self._write_session, params={"newState": "APPROVED"})
+        if body.get("type") != "success":
+            raise StrataSyncError(f"Approving the job failed: {body.get('message') or body}",
+                                  status=body.get("httpStatus"), body=body)
+        return (body.get("result") or {}).get("cdm") or {}
+
+    def unapprove_job(self, workflow_id: int) -> Dict[str, Any]:
+        """Set an APPROVED job back to COMPLETED, so it can be modified (see
+        JOB_UNAPPROVE_PATH: an undocumented endpoint that could change). Sent
+        once, never retried. Returns the updated job."""
+        body = self._post_json(JOB_UNAPPROVE_PATH.format(workflow_id=int(workflow_id)), None,
+                               session=self._write_session)
+        if body.get("type") != "success":
+            raise StrataSyncError(f"Unapproving the job failed: {body.get('message') or body}",
+                                  status=body.get("httpStatus"), body=body)
+        return (body.get("result") or {}).get("cdm") or {}
 
 
 def _days(start: date, end: date) -> Iterable[date]:

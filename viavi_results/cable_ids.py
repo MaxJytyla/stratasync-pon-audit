@@ -16,7 +16,9 @@ The lookup file is a CSV with one row per cable:
 A blank Cable ID is allowed (a cable whose serial isn't known yet): its jobs
 are created with the Cable ID left blank. A cable that isn't in the file at
 all is treated the same way. Recording a cable replacement writes the new
-cable's ID (or a blank) over the old one in the file.
+cable's ID (or a blank) over the old one in the file. A Cable ID that was never
+entered, or has a typo, is changed with cable_id_change.py, which also changes
+it on the cable's jobs.
 """
 
 from __future__ import annotations

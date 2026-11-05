@@ -24,7 +24,7 @@ from .config import (
     make_stratasync_settings,
     parse_service_account,
 )
-from . import cable_ids, history, scheduler
+from . import cable_id_change, cable_ids, history, scheduler
 from .pon_audit import DATA_HALLS
 from .sync import SyncResult, error_text as _error_text, last_position, replace_cable, run_sync, write_flags_csv
 
@@ -353,6 +353,8 @@ class App(ttk.Frame):
 
         buttons = ttk.Frame(bar)
         buttons.grid(row=0, column=4, rowspan=2, sticky="e")
+        self.cable_id_btn = ttk.Button(buttons, text="Change cable ID…", command=self._open_cable_id_dialog)
+        self.cable_id_btn.pack(side="left", padx=(0, PAD))
         self.replace_btn = ttk.Button(buttons, text="Replace cable…", command=self._open_replace_dialog)
         self.replace_btn.pack(side="left", padx=(0, PAD * 4))
         self.preview_btn = ttk.Button(buttons, text="Preview (no changes)", command=lambda: self._start(apply=False))
@@ -670,7 +672,7 @@ class App(ttk.Frame):
         self._clear_report()
         self.summary.configure(text="Running…" if apply else "Previewing…")
         self.tabs.select(3)
-        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+        for btn in self._action_buttons():
             btn.configure(state="disabled")
         self.progress.start(12)
 
@@ -710,7 +712,7 @@ class App(ttk.Frame):
 
     def _finish(self) -> None:
         self.progress.stop()
-        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+        for btn in self._action_buttons():
             btn.configure(state="normal")
         self._update_position()
         self._refresh_history()
@@ -720,7 +722,7 @@ class App(ttk.Frame):
         on it. Returns False (and does nothing) if something is already running."""
         if self.worker and self.worker.is_alive():
             return False
-        for btn in (self.replace_btn, self.preview_btn, self.run_btn):
+        for btn in self._action_buttons():
             btn.configure(state="disabled")
         self.progress.start(12)
 
@@ -734,6 +736,18 @@ class App(ttk.Frame):
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
         return True
+
+    def _action_buttons(self):
+        return (self.cable_id_btn, self.replace_btn, self.preview_btn, self.run_btn)
+
+    def _open_cable_id_dialog(self) -> None:
+        try:
+            self.stratasync_settings()
+        except ConfigError as exc:
+            messagebox.showerror(APP_NAME, f"{exc}\n\nThe cable's jobs are looked up in StrataSync.", parent=self.root)
+            return
+        self._save_form()
+        CableIdDialog(self)
 
     def _open_replace_dialog(self) -> None:
         try:
@@ -1062,6 +1076,246 @@ class CableDialog(tk.Toplevel):
         self.app._log(f"Error: {_error_text(exc)}")
         if self.winfo_exists():
             self.status.configure(text="Failed; see the message.")
+        messagebox.showerror(APP_NAME, _error_text(exc), parent=self if self.winfo_exists() else self.app.root)
+
+
+class CableIdDialog(tk.Toplevel):
+    """Enter a missing Cable ID, or fix a typo: in the Cable ID file and on the cable's jobs."""
+
+    TICK, NO_TICK, LOCKED = "\u2611", "\u2610", "\u2013"
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.plan: Optional[cable_id_change.CableIdCorrection] = None
+        self.ticked: set = set()
+        self.title("Change cable ID")
+        self.transient(app.root)
+        self.minsize(760, 480)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        form = ttk.Frame(self, padding=PAD * 2)
+        form.grid(row=0, column=0, sticky="ew")
+        form.columnconfigure(9, weight=1)
+        ttk.Label(form, text="Data hall:").grid(row=0, column=0, sticky="w")
+        self.data_hall = tk.StringVar(value=DATA_HALLS[0])
+        ttk.Combobox(form, textvariable=self.data_hall, values=DATA_HALLS, state="readonly",
+                     width=4).grid(row=0, column=1, sticky="w", padx=(PAD, PAD * 3))
+        ttk.Label(form, text="Row:").grid(row=0, column=2, sticky="w")
+        self.row = tk.StringVar()
+        ttk.Entry(form, textvariable=self.row, width=6).grid(row=0, column=3, sticky="w", padx=(PAD, PAD * 3))
+        ttk.Label(form, text="Channel:").grid(row=0, column=4, sticky="w")
+        self.channel = tk.StringVar(value="A")
+        for i, ch in enumerate("AB"):
+            ttk.Radiobutton(form, text=ch, value=ch, variable=self.channel).grid(row=0, column=5 + i, padx=(PAD, 0))
+        self.current = ttk.Label(form, text="", foreground="gray")
+        self.current.grid(row=0, column=8, columnspan=2, sticky="w", padx=(PAD * 3, 0))
+
+        ttk.Label(form, text="New cable ID:").grid(row=1, column=0, sticky="w", pady=(PAD, 0))
+        self.new_cable_id = tk.StringVar()
+        ttk.Entry(form, textvariable=self.new_cable_id, width=24).grid(row=1, column=1, columnspan=3, sticky="w",
+                                                                      padx=(PAD, 0), pady=(PAD, 0))
+        ttk.Button(form, text="Preview", command=self._preview).grid(row=1, column=4, columnspan=3, sticky="w",
+                                                                    pady=(PAD, 0))
+        ttk.Label(form, text="For a Cable ID that was never entered, or was entered wrong. The cable's base serial "
+                             "(e.g. S7XXXXXXXX031). It goes into the Cable ID file, and onto the cable's jobs you "
+                             "tick below. A replaced cable is a new cable: use Replace cable… for that instead.",
+                  foreground="gray", wraplength=720, justify="left").grid(row=2, column=0, columnspan=10, sticky="w")
+        self.approved = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Also change approved jobs (each is unapproved, changed and approved again)",
+                        variable=self.approved, command=self._approved_toggled
+                        ).grid(row=3, column=0, columnspan=10, sticky="w", pady=(PAD, 0))
+
+        self.status = ttk.Label(self, text="Choose the cable, enter its Cable ID and click Preview to see its jobs.",
+                                wraplength=720, justify="left", padding=(PAD * 2, 0))
+        self.status.grid(row=1, column=0, sticky="ew")
+
+        frame = ttk.Frame(self, padding=(PAD * 2, PAD))
+        frame.grid(row=2, column=0, sticky="nsew")
+        self.tree = app._tree(frame, ("tick", "job", "date", "state", "cable", "note"),
+                              ("Change", "Job", "Scheduled", "State", "Cable ID now", "Why it is or isn't ticked"),
+                              (60, 190, 90, 90, 130, 330))
+        self.tree.column("tick", anchor="center", stretch=False)
+        self.tree.configure(height=10)
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<space>", lambda _e: self._toggle(self.tree.focus()))
+
+        buttons = ttk.Frame(self, padding=PAD * 2)
+        buttons.grid(row=3, column=0, sticky="ew")
+        ttk.Label(buttons, text="Click a job to tick or untick it.", foreground="gray").pack(side="left")
+        self.apply_btn = ttk.Button(buttons, text="Change cable ID", command=self._apply, state="disabled")
+        self.apply_btn.pack(side="right", padx=(PAD, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+
+        for var in (self.data_hall, self.row, self.channel, self.new_cable_id):
+            var.trace_add("write", lambda *_: self._invalidate())
+        self._invalidate()
+
+    def _key(self):
+        try:
+            row = int(self.row.get().strip())
+        except ValueError:
+            raise ConfigError("Enter the row number.") from None
+        return cable_id_change.check_cable(self.data_hall.get(), row, self.channel.get())
+
+    def _invalidate(self) -> None:
+        self.plan = None
+        self.apply_btn.configure(state="disabled")
+        self.tree.delete(*self.tree.get_children())
+        try:
+            key = self._key()
+            lookup = cable_ids.load(self.app._cable_ids_path())
+        except (ConfigError, cable_ids.CableIdFileError) as exc:
+            self.current.configure(text="" if isinstance(exc, ConfigError) else str(exc))
+            return
+        if key in lookup.ids:
+            text = f"{cable_ids.cable_name(key)}: {lookup.ids[key] or '(blank)'} in the Cable ID file now"
+        else:
+            text = f"{cable_ids.cable_name(key)} isn't in the Cable ID file yet (it'll be added)"
+        self.current.configure(text=text)
+
+    def _preview(self) -> None:
+        try:
+            key = self._key()
+            ss = self.app.stratasync_settings()
+        except ConfigError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        try:
+            sheet = make_settings(self.app.sheet_id.get(), self.app.key_text.get("1.0", "end"))
+        except ConfigError:
+            sheet = None  # the replacement time then comes from this computer's history only
+        new, file = self.new_cable_id.get(), self.app.cable_ids_file.get().strip()
+        self.status.configure(text="Looking up the cable's jobs in StrataSync…")
+        log = lambda msg: self.app.events.put(("log", msg))
+        if not self.app.background(
+                lambda: cable_id_change.preview(ss, key, new, cable_ids_file=file, sheet=sheet, log=log),
+                self._show_preview, self._failed):
+            self.status.configure(text="Wait for the current run to finish, then click Preview again.")
+
+    def _show_preview(self, plan) -> None:
+        if not self.winfo_exists():
+            return
+        self.plan = plan
+        self.ticked = {j.workflow_id for j in plan.jobs if j.eligible and (self._can_tick(j))}
+        self._fill()
+        replaced = (f"Last replaced {plan.replaced_at.astimezone():%Y-%m-%d %H:%M} (from {plan.replaced_source}); "
+                    "jobs scheduled before that keep the old cable's ID. " if plan.replaced_at else
+                    "No replacement of this cable is recorded" + (
+                        f" on this computer ({plan.sheet_note}). " if plan.sheet_note else
+                        " on this computer or in the sheet. "))
+        file = (f"{plan.cable} in {plan.file.name}: {plan.old or '(blank)'} -> {plan.new or '(blank)'}"
+                + ("" if plan.in_file else " (added to the file)") + ". " if plan.file_changes else
+                f"{plan.file.name} already has {plan.new or '(blank)'} for {plan.cable}; only jobs change. ")
+        self.status.configure(text=" ".join(
+            [file + f"{len(plan.jobs)} job(s) on this cable. " + replaced.strip()]
+            + [f"Warning: {w}" for w in plan.warnings] + ["Nothing has been changed yet."]),
+            foreground="#b00020" if plan.warnings else "")
+        self._update_apply()
+
+    def _can_tick(self, job) -> bool:
+        return job.tickable and job.current != self.plan.new and (self.approved.get() or not job.approved)
+
+    def _fill(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for job in self.plan.jobs:
+            note = job.note
+            if job.approved and not self.approved.get():
+                note = "approved (locked): tick 'Also change approved jobs' above to change it. " + note
+            mark = (self.TICK if job.workflow_id in self.ticked else self.NO_TICK) if self._can_tick(job) else self.LOCKED
+            self.tree.insert("", "end", iid=str(job.workflow_id), values=(
+                mark, job.work_order_id, job.scheduled or "", job.state, job.current or "(blank)", note))
+
+    def _approved_toggled(self) -> None:
+        if not self.plan:
+            return
+        for job in self.plan.jobs:
+            if job.approved:
+                (self.ticked.add if job.eligible and self._can_tick(job) else self.ticked.discard)(job.workflow_id)
+        self._fill()
+        self._update_apply()
+
+    def _on_click(self, event) -> Optional[str]:
+        if self.tree.identify_region(event.x, event.y) in ("cell", "tree"):
+            self._toggle(self.tree.identify_row(event.y))
+        return None
+
+    def _toggle(self, iid: str) -> None:
+        if not (self.plan and iid):
+            return
+        job = next((j for j in self.plan.jobs if str(j.workflow_id) == iid), None)
+        if job is None or not self._can_tick(job):
+            return
+        self.ticked ^= {job.workflow_id}
+        self.tree.set(iid, "tick", self.TICK if job.workflow_id in self.ticked else self.NO_TICK)
+        self._update_apply()
+
+    def _chosen(self):
+        return [j for j in self.plan.jobs if j.workflow_id in self.ticked and self._can_tick(j)] if self.plan else []
+
+    def _update_apply(self) -> None:
+        ok = bool(self.plan and (self.plan.file_changes or self._chosen()))
+        self.apply_btn.configure(state="normal" if ok else "disabled")
+
+    def _apply(self) -> None:
+        plan, chosen = self.plan, self._chosen()
+        if not plan:
+            return
+        approved = [j for j in chosen if j.approved]
+        lines = [f"Change {plan.cable}'s Cable ID to {plan.new or '(blank)'}?", ""]
+        if plan.file_changes:
+            lines.append(f"Cable ID file ({plan.file.name}): {plan.old or '(blank)'} -> {plan.new or '(blank)'}. "
+                         "Jobs created from now on get the new ID.")
+        lines.append(f"{len(chosen)} job(s) in StrataSync get the new Cable ID"
+                     + (": " + ", ".join(j.work_order_id for j in chosen[:12]) + (" …" if len(chosen) > 12 else "")
+                        if chosen else "") + ".")
+        if approved:
+            lines.append(f"{len(approved)} of them are approved: each is unapproved, changed and approved again.")
+        left = [j for j in plan.jobs if j not in chosen]
+        if left:
+            lines.append(f"{len(left)} other job(s) of this cable keep their Cable ID.")
+        lines += ["", *[f"Warning: {w}" for w in plan.warnings]]
+        if not messagebox.askyesno(APP_NAME, "\n".join(lines).strip(), icon="warning", parent=self):
+            return
+        self.status.configure(text="Changing…", foreground="")
+        ss = self.app.stratasync_settings()
+        file, ticked, with_approved = self.app.cable_ids_file.get().strip(), {j.workflow_id for j in chosen}, self.approved.get()
+        log = lambda msg: self.app.events.put(("log", msg))
+        self.app.background(
+            lambda: cable_id_change.apply(ss, plan, ticked, approved=with_approved, cable_ids_file=file, log=log),
+            self._applied, self._failed)
+
+    def _applied(self, plan) -> None:
+        self.app._update_cable_ids_status()
+        lines = []
+        if plan.file_error:
+            lines.append(f"The Cable ID file wasn't updated ({plan.file_error}). Enter {plan.cable} = "
+                         f"{plan.new or '(blank)'} in it by hand.")
+        elif plan.file_changes:
+            lines.append(f"Cable ID file: {plan.cable} is now {plan.new or '(blank)'} (was {plan.old or '(blank)'}).")
+        lines.append(f"Jobs changed and checked: {len(plan.changed)}"
+                     + (": " + ", ".join(j.work_order_id for j in plan.changed[:12])
+                        + (" …" if len(plan.changed) > 12 else "") if plan.changed else "") + ".")
+        problems = [j for j in plan.jobs if j.outcome in ("failed", "skipped")]
+        if problems:
+            lines.append("Not changed:\n" + "\n".join(f"  {j.work_order_id}: {j.error}" for j in problems[:15])
+                         + ("\n  …" if len(problems) > 15 else ""))
+        if plan.stopped:
+            lines.append(f"Stopped early: {plan.stopped}")
+        if problems or plan.stopped:
+            lines.append("To retry, open Change cable ID… again for this cable with the same ID: jobs still holding "
+                         "the old one are ticked. Details are in the Log and in cable_id_jobs.csv.")
+        bad = plan.file_error or problems or plan.stopped
+        (messagebox.showwarning if bad else messagebox.showinfo)(
+            APP_NAME, "\n\n".join(lines), parent=self if self.winfo_exists() else self.app.root)
+        if self.winfo_exists():
+            self.destroy()
+
+    def _failed(self, exc) -> None:
+        self.app._log(f"Error: {_error_text(exc)}")
+        if self.winfo_exists():
+            self.status.configure(text="Failed; see the message.", foreground="#b00020")
         messagebox.showerror(APP_NAME, _error_text(exc), parent=self if self.winfo_exists() else self.app.root)
 
 
