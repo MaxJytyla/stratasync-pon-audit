@@ -24,7 +24,7 @@ from .config import (
     make_stratasync_settings,
     parse_service_account,
 )
-from . import cable_id_change, cable_ids, history, scheduler
+from . import cable_id_change, cable_ids, history, scheduler, updater
 from .pon_audit import DATA_HALLS
 from .sync import SyncResult, error_text as _error_text, last_position, replace_cable, run_sync, write_flags_csv
 
@@ -100,8 +100,11 @@ class App(ttk.Frame):
         self.history_mtime = -1.0
         self.polls = 0
         self.warned_no_secrets = False
+        self.update_checking = False
+        self.update_declined = ""  # the version the user said "not now" to; not asked again automatically
 
-        root.title(APP_NAME)
+        version = updater.version()
+        root.title(f"{APP_NAME}  ({version})" if version else APP_NAME)
         root.minsize(900, 420)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.content = self.canvas.create_window(0, 0, window=self, anchor="nw")
@@ -127,6 +130,8 @@ class App(ttk.Frame):
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._initial_size()
         self.after(100, self._poll)
+        if updater.supported():
+            self.after(3000, self._periodic_update_check)
 
     # ---- window size and scrolling ---------------------------------------------
 
@@ -259,8 +264,15 @@ class App(ttk.Frame):
         self.schedule_btn.pack(side="left")
         self.unschedule_btn = ttk.Button(buttons, text="Turn off", command=self._turn_off_schedule)
         self.unschedule_btn.pack(side="left", padx=(PAD, 0))
-        ttk.Button(box, text="Open history folder", command=lambda: _open_folder(history.history_dir())
-                   ).grid(row=0, column=5, sticky="e")
+        app_box = ttk.Frame(box)
+        app_box.grid(row=0, column=5, sticky="e")
+        ttk.Button(app_box, text="Open history folder", command=lambda: _open_folder(history.history_dir())
+                   ).pack(side="left")
+        self.app_update_btn = ttk.Button(app_box, text="Check for app updates",
+                                         command=lambda: self._check_app_update(quiet=False))
+        self.app_update_btn.pack(side="left", padx=(PAD, 0))
+        if not updater.supported():
+            self.app_update_btn.configure(state="disabled")
         self.schedule_status = ttk.Label(box, text="", foreground="gray", wraplength=840, justify="left")
         self.schedule_status.grid(row=1, column=0, columnspan=6, sticky="w", pady=(PAD, 0))
         if not scheduler.supported():
@@ -305,6 +317,87 @@ class App(ttk.Frame):
         self.cable_ids_status = ttk.Label(box, text="", foreground="gray", wraplength=840, justify="left")
         self.cable_ids_status.grid(row=4, column=0, columnspan=8, sticky="w", pady=(2, 0))
         self.cable_ids_file.trace_add("write", lambda *_: self._update_cable_ids_status())
+
+    # ---- app updates (from the git clone) ---------------------------------------
+
+    def _periodic_update_check(self) -> None:
+        self._check_app_update(quiet=True)
+        self.after(updater.CHECK_EVERY_MS, self._periodic_update_check)
+
+    def _check_app_update(self, quiet: bool) -> None:
+        """Look for new commits on the repo's main branch in the background.
+        `quiet`: an automatic check, which says nothing unless there's an update."""
+        if self.update_checking:
+            return
+        self.update_checking = True
+        self.app_update_btn.configure(state="disabled")
+
+        def work():
+            try:
+                info = updater.check()
+                self.events.put(("call", lambda: self._app_update_checked(info, quiet)))
+            except Exception as exc:  # shown (or logged, if quiet), not swallowed
+                self.events.put(("call", lambda exc=exc: self._app_update_failed(exc, quiet)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _app_update_failed(self, exc, quiet: bool) -> None:
+        self.update_checking = False
+        self.app_update_btn.configure(state="normal")
+        self._log(f"Couldn't check for app updates: {exc}")
+        if not quiet:
+            messagebox.showerror(APP_NAME, f"Couldn't check for app updates:\n\n{exc}", parent=self.root)
+
+    def _app_update_checked(self, info, quiet: bool) -> None:
+        self.update_checking = False
+        self.app_update_btn.configure(state="normal")
+        if not info.available:
+            if not quiet:
+                messagebox.showinfo(APP_NAME, f"The app is up to date ({updater.version()}).", parent=self.root)
+            return
+        if quiet and self.update_declined == info.latest:
+            return
+        if info.blocked:
+            self._log(f"An app update is available ({info.latest}), but it can't be installed from here: "
+                      f"{info.blocked}")
+            if not quiet:
+                messagebox.showwarning(APP_NAME, (
+                    f"An app update is available, but it can't be installed automatically: {info.blocked}.\n\n"
+                    "Update this copy by hand (see the README)."), parent=self.root)
+            self.update_declined = info.latest
+            return
+        if self.worker and self.worker.is_alive():
+            # Don't interrupt a run: ask once it's finished.
+            self.after(30_000, lambda: self._app_update_checked(info, quiet))
+            return
+        shown = info.commits[:10]
+        changes = "\n".join(f"  • {c}" for c in shown) + (
+            f"\n  … and {len(info.commits) - len(shown)} more" if len(info.commits) > len(shown) else "")
+        if not messagebox.askyesno(APP_NAME, (
+                f"A new version of the app is available ({len(info.commits)} change(s)):\n\n{changes}\n\n"
+                "Update now? The app downloads it and restarts. Your settings are kept."), parent=self.root):
+            self.update_declined = info.latest
+            self._log(f"App update {info.latest} available; not installed now (Check for app updates to install it)")
+            return
+        self._save_form()
+        self.summary.configure(text="Updating the app…")
+        if not self.background(lambda: updater.install(log=lambda m: self.events.put(("log", m))),
+                               lambda _r: self._restart(), self._app_update_install_failed):
+            self.after(30_000, lambda: self._app_update_checked(info, quiet))
+
+    def _app_update_install_failed(self, exc) -> None:
+        self._log(f"App update failed: {_error_text(exc)}")
+        self.summary.configure(text="The app update failed; see the Log tab. The app is unchanged unless it says so.")
+        messagebox.showerror(APP_NAME, _error_text(exc), parent=self.root)
+
+    def _restart(self) -> None:
+        try:
+            updater.restart()
+        except OSError as exc:
+            messagebox.showwarning(APP_NAME, f"The app was updated, but couldn't restart itself ({exc}). "
+                                             "Close it and start it again.", parent=self.root)
+            return
+        self.root.destroy()
 
     def _cable_ids_path(self) -> Path:
         return cable_ids_path(self.cable_ids_file.get())

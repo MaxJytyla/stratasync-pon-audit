@@ -2,16 +2,64 @@
 
 A desktop app for Windows and macOS. It pulls new VIAVI TruePON test results from StrataSync and writes them into the RMN2 PON Audit Google Sheet, then shows a report of what was written and what was flagged.
 
-## Download
+## Install
 
-Get the latest build from this repo's **Releases** page (or from the artifacts of the latest **Build** workflow run):
+The built apps (Releases) aren't code-signed, and some computers block them. So the app is run from a copy of this repo with Python instead. It keeps itself up to date from the repo (see **Updating the app** below).
 
-| Platform | File | How to open it |
-|---|---|---|
-| Windows | `StrataSync-PON-Audit-Windows.exe` | Double-click it. If SmartScreen warns about an unrecognized app, click **More info → Run anyway**. |
-| macOS (Apple silicon) | `StrataSync-PON-Audit-macOS.zip` | Unzip it and move **StrataSync PON Audit.app** to Applications. The first time, right-click the app and choose **Open**, then confirm. If macOS says the app is damaged, run `xattr -dr com.apple.quarantine "/Applications/StrataSync PON Audit.app"` once. |
+### Windows
 
-The builds aren't code-signed, which is why the first launch needs those extra steps.
+1. Install **Python 3.13** from [python.org](https://www.python.org/downloads/windows/). On the installer's first screen, tick **Add python.exe to PATH**.
+2. Install **Git** from [git-scm.com](https://git-scm.com/download/win) (the default options are fine).
+3. Open **PowerShell** (Start menu → type "PowerShell") and run these one at a time. The app goes in `Documents\stratasync-pon-audit`.
+
+   ```powershell
+   cd $HOME\Documents
+   git clone https://github.com/MaxJytyla/stratasync-pon-audit.git
+   cd stratasync-pon-audit
+   py -3.13 -m venv .venv
+   .venv\Scripts\python -m pip install -r requirements.txt
+   ```
+
+4. To start the app, double-click **Start PON Audit.bat** in that folder. To put it on the desktop, right-click it → **Show more options → Send to → Desktop (create shortcut)**. (From PowerShell: `.venv\Scripts\pythonw app.py` in the folder.)
+
+### macOS
+
+1. Install **Python 3.13** from [python.org](https://www.python.org/downloads/macos/) (it includes Tk, which the window needs). With Homebrew Python instead, also run `brew install python-tk@3.13`.
+2. Open **Terminal** (Applications → Utilities). If `git --version` asks to install the command line developer tools, click **Install** and wait for it to finish.
+3. Run these one at a time. The app goes in `Documents/stratasync-pon-audit`.
+
+   ```bash
+   cd ~/Documents
+   git clone https://github.com/MaxJytyla/stratasync-pon-audit.git
+   cd stratasync-pon-audit
+   python3.13 -m venv .venv
+   .venv/bin/python -m pip install -r requirements.txt
+   ```
+
+4. To start the app, double-click **Start PON Audit.command** in that folder (it opens Terminal briefly). To keep it in the Dock, drag it there. (From Terminal: `.venv/bin/python app.py` in the folder.)
+
+### Moving from a downloaded build
+
+Settings, the download position, the history and the Cable ID file are kept in the app's data folder (see **Where the app keeps its data**), not with the app, so the clone picks them all up. If automatic updates were on, open the clone's app and click **Turn on** (or **Update**) under **Automatic updates** once, so they run the clone instead of the old build. Then delete the old build.
+
+### Updating the app
+
+When the app opens, and every 4 hours while it's open, it checks this repo's `main` branch for new commits. If there are some, it lists them and asks whether to update. **Yes** downloads them (`git pull`), installs any new requirements, and restarts the app; settings are kept. **No** waits until the next time you open the app, or click **Check for app updates** (under **Automatic updates**). The window's title shows the version running (commit and date).
+
+- It doesn't ask in the middle of an update from the window; it waits for it to finish. It doesn't update while an automatic update is running either ("Another update is running"); try again in a minute.
+- Automatic updates run the clone's code, so they use the new version from their next run.
+- It only updates a clean copy on `main`: if files in the folder were edited, or it's on another branch, it says so and leaves it alone. To update such a copy by hand, in the folder:
+
+  ```bash
+  git status                 # what was changed
+  git checkout -- .          # throw those changes away (only if you don't need them)
+  git pull --ff-only origin main
+  ```
+
+  then install the requirements again (step 3's last command) and restart the app.
+- Updating needs internet access to github.com. If the check fails (offline, proxy), the Log tab says so and the app works as before.
+
+The Releases builds still exist for computers that allow them (Windows: SmartScreen → **More info → Run anyway**; macOS: right-click → **Open**). They don't update themselves.
 
 ## Using it
 
@@ -35,8 +83,8 @@ Under **Automatic updates**, choose how often (e.g. every 1 hour or every 30 min
 - Automatic updates use the settings saved in the window, so **Remember client secret and Google key on this computer** must be ticked. Changes you make in the window are used from the next update on.
 - They run only while you're signed in to the computer and it's awake. A run missed while the computer was asleep happens when it wakes.
 - Only one update runs at a time on a computer. If an automatic update starts while one from the window (or a cable replacement) is running, it's skipped and recorded as `skipped`. The next one catches up, because each update continues from the saved download position.
-- Windows: it's a Task Scheduler task named **StrataSync PON Audit update**. macOS: it's a LaunchAgent, `~/Library/LaunchAgents/com.stratasync.ponaudit.update.plist`. macOS may show a "Background Items Added" notice. Run the app from Applications before turning this on, not from Downloads.
-- The schedule starts the copy of the app that turned it on. After you download a new version to a different place, open it and click **Turn on** again. The app notes when the schedule points at a different copy.
+- Windows: it's a Task Scheduler task named **StrataSync PON Audit update**. macOS: it's a LaunchAgent, `~/Library/LaunchAgents/com.stratasync.ponaudit.update.plist`. macOS may show a "Background Items Added" notice. With a downloaded build on macOS, run it from Applications before turning this on, not from Downloads.
+- The schedule starts the copy of the app that turned it on. Updating the clone (see **Updating the app**) doesn't change that. After you move the app to a different place (e.g. from a downloaded build to a clone), open it and click **Turn on** again. The app notes when the schedule points at a different copy.
 
 ### Update history
 
@@ -193,10 +241,14 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ```
 app.py                entry point (--auto-update: one update with the saved settings, no window)
+Start PON Audit.bat   Windows launcher for a clone (pythonw, no console)
+Start PON Audit.command  macOS launcher for a clone
 build.py              PyInstaller build
 scripts/smoke_gui.py  opens the window and checks sizing and scrolling (run by the Build workflow)
 viavi_results/
   gui.py              the window: settings form, run, report, CSV export
+  updater.py          checks origin/main for new commits; pulls (fast-forward only) and restarts
+  cable_id_change.py  Change cable ID: the Cable ID file and the cable's jobs
   sync.py             one sync run: search -> plan -> write, flags CSV, run lock
   scheduler.py        automatic updates: launchd / Task Scheduler, the headless run
   history.py          update history: runs.csv, flagged.csv, written.csv
