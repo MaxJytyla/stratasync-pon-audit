@@ -56,9 +56,10 @@ from .stratasync import StrataSyncClient, StrataSyncError
 
 Log = Callable[[str], None]
 
-# What the site's Cable IDs look like (S7 + 8 characters + 031). Anything else
-# gets a warning, not a refusal: it's a likely typo, but the format may change.
-CABLE_ID_FORMAT = re.compile(r"^S7[0-9A-Z]{8}031$")
+# What the site's Cable IDs look like: S7 + 8 characters + 031, or the
+# alternative TS + 8 characters + 030. Anything else gets a warning, not a
+# refusal: it's a likely typo, but the format may change.
+CABLE_ID_FORMAT = re.compile(r"^(S7[0-9A-Z]{8}031|TS[0-9A-Z]{8}030)$")
 
 
 @dataclass
@@ -290,7 +291,8 @@ def plan_change(key: CableKey, new: str, *, cable_ids_file: str, jobs: Sequence[
     if not new:
         plan.warnings.append("The new Cable ID is blank: the ticked jobs' Cable ID will be cleared.")
     elif not CABLE_ID_FORMAT.match(new):
-        plan.warnings.append(f"{new!r} doesn't look like the site's other Cable IDs (S7 + 8 characters + 031). "
+        plan.warnings.append(f"{new!r} doesn't look like the site's other Cable IDs (S7 + 8 characters + 031, "
+                             "or TS + 8 characters + 030). "
                              "Check it for a typo.")
     others = [cable_name(k) for k, v in lookup.ids.items() if k != key and v and _same(v, new)]
     if others:

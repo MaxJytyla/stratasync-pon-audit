@@ -158,7 +158,7 @@ How it's done, and what's checked:
 - Only the job's Cable ID is sent (the same change new jobs get), never its technician, which would reset the job. After each job, its state, technician, dates and results are compared with before; at the first one where anything else changed, it stops and says which. At the end, every changed job is looked up again to check its Cable ID.
 - Everything is looked up again when you click **Change cable ID**. If the file's Cable ID for the cable changed since the preview, nothing is changed (preview again). A ticked job whose Cable ID changed since is skipped.
 - The jobs are changed first, then the file, so jobs re-issued in the meantime don't get a mix. The file is changed even if some jobs failed, since the new ID is the right one. It runs as an update does: not at the same time as an update or cable replacement on this computer.
-- The preview warns if the new ID doesn't look like the site's others (S7 + 8 characters + 031), or if another cable in the file already has it.
+- The preview warns if the new ID doesn't look like the site's others (S7 + 8 characters + 031, or TS + 8 characters + 030), or if another cable in the file already has it.
 - **To retry** jobs that failed or were skipped, do it again with the same ID. The file already has it, so only jobs change, and jobs still holding the ID it replaced (from this computer's history) are ticked.
 - Each change goes into `cable_ids.csv` and each job into `cable_id_jobs.csv` in the history folder, and the Log lists every step.
 
