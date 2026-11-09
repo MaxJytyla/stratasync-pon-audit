@@ -118,7 +118,7 @@ def _guarded(fn: Callable[[], Any]) -> Any:
 def _run(args: List[str], timeout: float = _COMMAND_TIMEOUT) -> Dict[str, Any]:
     proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                           stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW)
-    return {"exit": proc.returncode, "out": proc.stdout.strip()[:6000], "err": proc.stderr.strip()[:6000]}
+    return {"exit": proc.returncode, "out": proc.stdout.strip(), "err": proc.stderr.strip()}
 
 
 # ---- One connection -------------------------------------------------------------
