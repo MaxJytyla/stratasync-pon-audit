@@ -9,6 +9,8 @@ Each update (from the window or an automatic one) appends to CSV files in
   jobs.csv      every job re-issued (or that failed to be): name, locations, why, Cable ID
   cable_ids.csv every change to the Cable ID lookup file, by a cable replacement or a Cable ID change
   cable_id_jobs.csv every StrataSync job whose Cable ID a Cable ID change set (or failed to)
+  cable_replacements.csv every applied cable replacement, including failed ones: who, outcome, counts
+  cable_replacement_racks.csv every rack of those replacements: what it held and whether it was to be cleared
 
 Automatic updates also append their progress messages to automatic.log.
 Nothing here is ever rewritten or pruned, so the files are an audit trail.
@@ -17,6 +19,8 @@ Nothing here is ever rewritten or pruned, so the files are an audit trail.
 from __future__ import annotations
 
 import csv
+import getpass
+import platform
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence
@@ -24,7 +28,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequ
 from .config import app_data_dir
 
 if TYPE_CHECKING:
-    from .pon_audit import Flag
+    from .pon_audit import CableReplacementPlan, Flag
     from .reissue import ReissuePlan
     from .sync import SyncResult
 
@@ -51,6 +55,11 @@ CABLE_IDS_HEADER = ["run_at", "sheet", "cable", "replaced_at", "old_cable_id", "
                     "change", "jobs"]
 CABLE_ID_JOBS_HEADER = ["run_at", "cable", "workflow_id", "work_order_id", "scheduled", "state", "old_cable_id",
                         "new_cable_id", "outcome", "error"]
+CABLE_REPLACEMENTS_HEADER = ["run_at", "user", "computer", "status", "sheet", "tab", "cable", "replaced_at", "racks",
+                             "cleared", "left_alone", "cells_written", "old_cable_id", "new_cable_id",
+                             "jobs_created", "jobs_failed", "message"]
+CABLE_REPLACEMENT_RACKS_HEADER = ["run_at", "cable", "replaced_at", "tab", "rack", "sheet_row", "action", "reason",
+                                  "old_dbm", "old_timestamp"]
 
 LOG_MAX_BYTES = 5_000_000
 
@@ -172,6 +181,43 @@ def record_cable_id_jobs(cable: str, jobs: Iterable, new: str, log: Log = print)
              j.outcome, j.error] for j in jobs], log)
     except OSError as exc:
         log(f"Could not save the Cable ID job history: {exc}")
+
+
+def _user() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # no login name available; the record is still worth keeping
+        return ""
+
+
+def new_cable_replacement(sheet: str, cable: str, replaced_at: str, new_cable_id: str) -> Dict[str, object]:
+    """A cable_replacements.csv row for an attempt that's starting. The
+    replacement fills it in as it goes, so a failure records how far it got."""
+    row: Dict[str, object] = dict.fromkeys(CABLE_REPLACEMENTS_HEADER, "")
+    row.update(run_at=_now(), user=_user(), computer=platform.node(), sheet=sheet, cable=cable,
+               replaced_at=replaced_at, new_cable_id=new_cable_id)
+    return row
+
+
+def record_cable_replacement(attempt: Dict[str, object], log: Log = print) -> None:
+    """Append a finished attempt to cable_replacements.csv."""
+    row = {**attempt, "message": " ".join(str(attempt["message"]).split())}
+    try:
+        _append("cable_replacements.csv", CABLE_REPLACEMENTS_HEADER, [list(row.values())], log)
+    except OSError as exc:  # the sheet may already be written; don't turn that into a failure
+        log(f"Could not save the cable replacement history: {exc}")
+
+
+def record_cable_replacement_racks(attempt: Dict[str, object], plan: "CableReplacementPlan", log: Log = print) -> None:
+    """Append what each rack holds to cable_replacement_racks.csv. Called before
+    the sheet is written, so the old values are kept however the write ends."""
+    try:
+        _append("cable_replacement_racks.csv", CABLE_REPLACEMENT_RACKS_HEADER, [
+            [attempt["run_at"], attempt["cable"], attempt["replaced_at"], plan.tab, r.rack, r.row,
+             "clear" if r.cleared else "leave", r.reason, r.old_power, r.old_timestamp]
+            for r in plan.racks], log)
+    except OSError as exc:
+        log(f"Could not save the cable replacement's rack history: {exc}")
 
 
 def cable_id_history() -> List[Dict[str, str]]:
