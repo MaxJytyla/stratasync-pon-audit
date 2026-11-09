@@ -5,12 +5,14 @@ scrolling. Run by the Build workflow on Windows and macOS before building.
     python scripts/smoke_gui.py
 """
 
+import json
 import sys
 import tkinter as tk
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from viavi_results import diagnostics  # noqa: E402
 from viavi_results.gui import App  # noqa: E402
 
 
@@ -58,6 +60,19 @@ def main() -> int:
     root.update()
     root.destroy()
     print("GUI smoke test passed")
+    return check_diagnostics()
+
+
+def check_diagnostics() -> int:
+    """The connection report's system checks differ per platform, and only run after a failure."""
+    path = diagnostics.capture(RuntimeError("smoke test"))
+    assert path, "the connection report wasn't saved"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    print(json.dumps({"environment": report["environment"], "system": report["system"],
+                      "sheets_host": report["hosts"]["sheets.googleapis.com"]}, indent=1)[:12000])
+    assert "collection_error" not in report["system"], report["system"]
+    assert all("attempts" in h for h in report["hosts"].values()), "a host wasn't tested"
+    print(f"Connection report passed in {report['duration_seconds']}s")
     return 0
 
 

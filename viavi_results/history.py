@@ -11,6 +11,8 @@ Each update (from the window or an automatic one) appends to CSV files in
   cable_id_jobs.csv every StrataSync job whose Cable ID a Cable ID change set (or failed to)
   cable_replacements.csv every applied cable replacement, including failed ones: who, outcome, counts
   cable_replacement_racks.csv every rack of those replacements: what it held and whether it was to be cleared
+  connection_drops.csv every dropped connection to Google Sheets, including ones a retry recovered from
+  connection_problems/ a network report for each failure to reach Google (see diagnostics.py)
 
 Automatic updates also append their progress messages to automatic.log.
 Nothing here is ever rewritten or pruned, so the files are an audit trail.
@@ -60,6 +62,7 @@ CABLE_REPLACEMENTS_HEADER = ["run_at", "user", "computer", "status", "sheet", "t
                              "jobs_created", "jobs_failed", "message"]
 CABLE_REPLACEMENT_RACKS_HEADER = ["run_at", "cable", "replaced_at", "tab", "rack", "sheet_row", "action", "reason",
                                   "old_dbm", "old_timestamp"]
+CONNECTION_DROPS_HEADER = ["time", "host", "error_type", "error", "retries_left"]
 
 LOG_MAX_BYTES = 5_000_000
 
@@ -218,6 +221,15 @@ def record_cable_replacement_racks(attempt: Dict[str, object], plan: "CableRepla
             for r in plan.racks], log)
     except OSError as exc:
         log(f"Could not save the cable replacement's rack history: {exc}")
+
+
+def record_connection_drop(host: str, error: BaseException, retries_left: object) -> None:
+    """Note a dropped connection to Google, even one a retry then recovers from."""
+    try:
+        _append("connection_drops.csv", CONNECTION_DROPS_HEADER, [
+            [_now(), host, type(error).__name__, " ".join(str(error).split())[:500], retries_left]], lambda _: None)
+    except OSError:
+        pass  # a note about a retry must never stop the retry
 
 
 def cable_id_history() -> List[Dict[str, str]]:
