@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import cable_ids as cable_id_file
 from . import history
@@ -421,15 +421,28 @@ def replace_cable(
 
     Returns (sheet title, CableReplacementPlan, jobs plan or None, Cable ID
     change or None). The sheet is read afresh each time, so applying never
-    relies on an earlier preview's values.
+    relies on an earlier preview's values. Applied attempts, including failed
+    ones, are recorded in the history.
     """
     if replaced_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise ConfigError("The replacement time is in the future. Every test before it would be "
                           "ignored, including tests of the new cable.")
-    with run_lock():
-        return _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log,
-                              jobs_for=jobs_for, template=template, new_cable_id=new_cable_id,
-                              cable_ids_file=cable_ids_file)
+    attempt = history.new_cable_replacement(settings.sheet_id, cable_name((data_hall, row, channel)),
+                                            replaced_at.isoformat(timespec="seconds"), (new_cable_id or "").strip())
+    try:
+        with run_lock():
+            result = _replace_cable(settings, data_hall, row, channel, replaced_at, apply=apply, log=log,
+                                    jobs_for=jobs_for, template=template, new_cable_id=new_cable_id,
+                                    cable_ids_file=cable_ids_file, attempt=attempt)
+    except Exception as exc:
+        if apply:
+            # cells_written is set once the sheet has been changed.
+            attempt.update(status="failed" if attempt["cells_written"] == "" else "partial", message=error_text(exc))
+            history.record_cable_replacement(attempt, log)
+        raise
+    if apply:
+        history.record_cable_replacement(attempt, log)
+    return result
 
 
 @dataclass
@@ -445,10 +458,12 @@ class CableIdChange:
 
 def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, replaced_at: datetime,
                    *, apply: bool, log: Log, jobs_for: Optional[StrataSyncSettings], template: str,
-                   new_cable_id: Optional[str], cable_ids_file: str,
+                   new_cable_id: Optional[str], cable_ids_file: str, attempt: Dict[str, object],
                    ) -> Tuple[str, CableReplacementPlan, Optional[ReissuePlan], Optional[CableIdChange]]:
     writer = SheetWriter(settings)
+    attempt["sheet"] = writer.spreadsheet.title
     tab = rack_tab(data_hall)
+    attempt["tab"] = tab
     values = writer.read_tabs([tab]).get(tab)
     if values is None:
         raise ConfigError(f"Tab {tab!r} not found in '{writer.spreadsheet.title}'.")
@@ -472,7 +487,11 @@ def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, r
                                     plan.replaced_at, jobs, cable_id=change.new if change else "")
     if not apply:
         return writer.spreadsheet.title, plan, jobs_plan, change
+    attempt.update(racks=len(plan.racks), cleared=cleared, left_alone=len(plan.racks) - cleared,
+                   old_cable_id=change.old if change else "")
+    history.record_cable_replacement_racks(attempt, plan, log)
     n = writer.write_cells(plan.updates)
+    attempt["cells_written"] = n
     log(f"Cable replaced: {plan.cable} at {plan.replaced_at}. Cleared {cleared} rack(s) "
         f"({n} cells) in '{tab}'" + (f", left {len(plan.racks) - cleared} alone" if cleared < len(plan.racks) else ""))
     if change is not None:
@@ -488,6 +507,13 @@ def _replace_cable(settings: Settings, data_hall: str, row: int, channel: str, r
     if jobs_plan and jobs_plan.jobs:
         create_jobs(client, jobs_plan, template, log)
         history.record_jobs(jobs_plan, history.CABLE, writer.spreadsheet.title, log)
+    problems = [f"Cable ID file: {change.error}"] if change and change.error else []
+    if jobs_plan:
+        problems += [f"{j.work_order_id}: {j.error}" for j in jobs_plan.failures]
+        problems += [f"{j.work_order_id}: Cable ID not set: {j.cable_id_error}" for j in jobs_plan.jobs if j.cable_id_error]
+        attempt.update(jobs_created=sum(j.status == "created" for j in jobs_plan.jobs),
+                       jobs_failed=len(jobs_plan.failures))
+    attempt.update(status="partial" if problems else "ok", message="; ".join(problems))
     return writer.spreadsheet.title, plan, jobs_plan, change
 
 
